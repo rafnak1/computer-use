@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cu test form</title>
+<style>
+  body { font: 18px/1.4 sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin: 16px 0 4px; }
+  input[type=text], textarea { width: 100%; font: inherit; padding: 6px; box-sizing: border-box; }
+  #out { margin-top: 24px; padding: 12px; border: 2px solid #2563eb; white-space: pre-wrap; min-height: 2em; }
+  .spacer { height: 1600px; }
+</style>
+</head>
+<body>
+<h1 id="top">cu test form</h1>
+<label for="name">Name</label>
+<input id="name" type="text" autofocus>
+<label for="msg">Message</label>
+<textarea id="msg" rows="3"></textarea>
+<label><input id="agree" type="checkbox"> I agree (required)</label>
+<p><button id="preview" type="button">Preview</button></p>
+<div id="out" aria-live="polite"></div>
+<div class="spacer"></div>
+<p><button type="button" onclick="document.getElementById('top').scrollIntoView()">Back to top</button></p>
+<script>
+document.getElementById('preview').addEventListener('click', function () {
+  var out = document.getElementById('out');
+  if (!document.getElementById('agree').checked) { out.textContent = 'Please tick the checkbox.'; return; }
+  out.textContent = 'Name: ' + document.getElementById('name').value + '\nMessage: ' + document.getElementById('msg').value;
+});
+</script>
+</body>
+</html>
