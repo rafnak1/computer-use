@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 from contextlib import redirect_stdout
 
@@ -303,3 +304,346 @@ class ScreenshotPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeKeymapDisplay:
+    """In-memory stand-in for the XDisplay keymap methods used by type_text."""
+
+    def __init__(self, rows, direct, mask=0, modifiers=(), pressed=()):
+        self.rows = dict(rows)
+        # Simulated (possibly stale) client-side XKB cache: (keycode, level) -> keysym
+        self.xkb = {(kc, int(shift)): ks for ks, (kc, shift) in direct.items()}
+        xkb = self.xkb
+
+        class X11:
+            @staticmethod
+            def XkbKeycodeToKeysym(_dpy, kc, _group, level):
+                return xkb.get((kc, level), 0)
+        self.x11 = X11
+        self.dpy = None
+        self.mask = mask
+        self.mods = set(modifiers)
+        self.pressed = set(pressed)
+        self._errors = []
+        self.log = []
+
+    # keymap API
+    def keyboard_mapping(self, first=None, count=None):
+        kcs = sorted(self.rows)
+        first = kcs[0] if first is None else first
+        count = kcs[-1] - first + 1 if count is None else count
+        return kcs[0], kcs[-1], 2, {k: self.rows[k] for k in range(first, first + count) if k in self.rows}
+
+    def keycode_row(self, kc):
+        return self.rows[kc]
+
+    def set_keycode_row(self, kc, row):
+        self.log.append(("map", kc, tuple(row)))
+        syms = [ks for ks in row if ks]
+        if syms and len(set(syms)) == 1:
+            row = (syms[0], 0, syms[0])  # like XKB: a one-level key reads back rewritten
+        self.rows[kc] = tuple(row)
+
+    def sync(self):
+        pass
+
+    def modifier_keycodes(self):
+        return set(self.mods)
+
+    def pressed_keycodes(self):
+        return set(self.pressed)
+
+    def modifier_mask(self):
+        return self.mask
+
+    direct_keysyms = cu.XDisplay.direct_keysyms
+
+    def keycode_levels(self, ks):
+        return (50, False) if ks == cu.SHIFT_KEYSYM else (0, False)
+
+    def tap(self, codes):
+        self.log.append(("tap", tuple(codes), tuple(self.rows.get(c) for c in codes)))
+
+    type_text = cu.XDisplay.type_text
+
+
+class KeymapTestBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name, "DISPLAY": ":99"})
+        self.env.start()
+        self.settle = unittest.mock.patch.object(cu, "KEYMAP_SETTLE", 0)
+        self.settle.start()
+
+    def tearDown(self):
+        self.settle.stop()
+        self.env.stop()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def layout(empty=(200, 201)):
+        rows = {kc: (0x61 + kc - 10, 0x41 + kc - 10) for kc in range(10, 36)}  # fake letters
+        rows[65] = (0x20, 0x20)
+        for kc in empty:
+            rows[kc] = (0, 0)
+        direct = {row[0]: (kc, False) for kc, row in rows.items() if row[0]}
+        direct.update({row[1]: (kc, True) for kc, row in rows.items() if row[1]})
+        return rows, direct
+
+
+class TypingPlanTests(unittest.TestCase):
+    def test_text_keysyms(self):
+        self.assertEqual(cu.text_keysyms("a\r\né😀"), [0x61, 0xFF0D, 0xE9, 0x0101F600])
+        for bad in ("a\x07", "\x85", "\udc80"):
+            with self.assertRaises(cu.CuError):
+                cu.text_keysyms(bad)
+
+    def test_blocking_state(self):
+        self.assertEqual(cu.blocking_state(0x10), [])  # NumLock is fine
+        self.assertEqual(cu.blocking_state(0x02 | 0x2000), ["Caps Lock", "keyboard group 2"])
+
+    def test_find_scratch_keycodes(self):
+        rows = {7: (0,), 8: (0, 0), 9: (0x61,), 10: (0, 0x41), 11: (), 12: (0,)}
+        self.assertEqual(cu.find_scratch_keycodes(rows, exclude={12}), [11, 8])
+
+    def test_plan_reuses_slots_and_batches(self):
+        direct = {0x61: (38, False)}
+        batches = cu.plan_typing([0xE9, 0x61, 0xE9, 0xE7, 0xE3], direct, 2)
+        self.assertEqual(batches, [
+            ([0xE9, 0xE7], [("scratch", 0), ("key", 38, False), ("scratch", 0), ("scratch", 1)]),
+            ([0xE3], [("scratch", 0)]),
+        ])
+
+    def test_plan_without_scratch(self):
+        self.assertEqual(cu.plan_typing([0x61], {0x61: (38, False)}, 0), [([], [("key", 38, False)])])
+        with self.assertRaises(cu.CuError) as cm:
+            cu.plan_typing([0xE9], {}, 0)
+        self.assertEqual(cm.exception.code, "no_scratch_keycode")
+
+    def test_type_validation_rejects_controls(self):
+        with self.assertRaises(cu.CuError):
+            cu.validate_action({"action": "type", "text": "a\x1bb"})
+
+
+class ScratchTypingTests(KeymapTestBase):
+    def test_types_and_restores(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        out = xd.type_text("aé ça é")
+        self.assertEqual(out, {"remapped_characters": 3})
+        taps = [e for e in xd.log if e[0] == "tap"]
+        self.assertEqual(taps[1], ("tap", (201,), ((0xE9, 0, 0xE9),)))
+        self.assertFalse(cu.row_signature(xd.rows[200]))
+        self.assertFalse(cu.row_signature(xd.rows[201]))
+        # only one install per distinct keysym, one restore each
+        self.assertEqual(sum(1 for e in xd.log if e[0] == "map"), 4)
+
+    def test_direct_only_does_not_touch_keymap(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        self.assertEqual(xd.type_text("aB"), {"remapped_characters": 0})
+        self.assertFalse([e for e in xd.log if e[0] == "map"])
+        self.assertEqual(xd.log[1], ("tap", (50, 11), (None, (0x62, 0x42))))
+
+    def test_batches_when_scratch_runs_out(self):
+        rows, direct = self.layout(empty=(200,))
+        xd = FakeKeymapDisplay(rows, direct)
+        xd.type_text("éçé")
+        taps = [e[2][0][0] for e in xd.log if e[0] == "tap"]
+        self.assertEqual(taps, [0xE9, 0xE7, 0xE9])
+        self.assertFalse(cu.row_signature(xd.rows[200]))
+
+    def test_excludes_modifier_and_pressed_keycodes(self):
+        rows, direct = self.layout(empty=(200, 201, 202))
+        xd = FakeKeymapDisplay(rows, direct, modifiers={202}, pressed={201})
+        xd.type_text("é")
+        self.assertIn(("tap", (200,), ((0xE9, 0, 0xE9),)), xd.log)
+
+    def test_rejects_caps_lock_before_input(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct, mask=0x02)
+        with self.assertRaises(cu.CuError) as cm:
+            xd.type_text("é")
+        self.assertEqual(cm.exception.code, "keyboard_state")
+        self.assertEqual(xd.log, [])
+
+    def test_no_scratch_fails_before_input(self):
+        rows, direct = self.layout(empty=())
+        xd = FakeKeymapDisplay(rows, direct)
+        with self.assertRaises(cu.CuError) as cm:
+            xd.type_text("aé")
+        self.assertEqual(cm.exception.code, "no_scratch_keycode")
+        self.assertEqual(xd.log, [])
+
+    def test_interrupt_restores(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+
+        def boom(codes):
+            raise KeyboardInterrupt
+        xd.tap = boom
+        with self.assertRaises(KeyboardInterrupt):
+            xd.type_text("é")
+        self.assertFalse(cu.row_signature(xd.rows[201]))
+
+    def test_conflicting_change_is_left_alone(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_tap = xd.tap
+
+        def tap(codes):
+            orig_tap(codes)
+            xd.rows[201] = (0x20AC, 0x20AC)  # another client rebinds our key
+        xd.tap = tap
+        out = xd.type_text("é")
+        self.assertEqual(out["keymap_conflicts"], [201])
+        self.assertEqual(xd.rows[201], (0x20AC, 0x20AC))
+
+    def write_journal(self, keys, mode=0o600):
+        path = cu.keymap_state_paths()[1]
+        with open(path, "w") as fh:
+            json.dump({"pid": 1, "keys": keys}, fh)
+        os.chmod(path, mode)
+        return path
+
+    def test_recovers_after_killed_run(self):
+        rows, direct = self.layout()
+        rows[201] = (0xE9, 0xE9)  # left behind by a killed run
+        rows[200] = (0x20AC, 0x20AC)  # recorded too, but since changed by someone else
+        path = self.write_journal({"201": [[0xE9, 0xE9]], "200": [[0xE7, 0xE7]]})
+        xd = FakeKeymapDisplay(rows, direct)
+        out = xd.type_text("ç")
+        self.assertFalse(cu.row_signature(xd.rows[201]))
+        self.assertEqual(xd.rows[200], (0x20AC, 0x20AC))
+        self.assertEqual(out["keymap_conflicts"], [200])
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["keys"], {})
+
+    def test_recovers_row_rewritten_by_server(self):
+        rows, direct = self.layout()
+        rows[201] = (0xE9, 0, 0xE9, 0)  # how the server reports the [e, e] we installed
+        self.write_journal({"201": [[0xE9, 0xE9]]})
+        xd = FakeKeymapDisplay(rows, direct)
+        out = xd.type_text("a")
+        self.assertFalse(cu.row_signature(xd.rows[201]))
+        self.assertNotIn("keymap_conflicts", out)
+
+    def test_shift_only_rebinding_is_a_conflict(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_tap = xd.tap
+
+        def tap(codes):
+            orig_tap(codes)
+            xd.rows[201] = (0, 0xE9)  # same keysym, but shift-only: not ours
+        xd.tap = tap
+        out = xd.type_text("é")
+        self.assertEqual(out["keymap_conflicts"], [201])
+        self.assertEqual(xd.rows[201], (0, 0xE9))
+
+    def test_readback_row_is_journaled(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_tap = xd.tap
+        seen = []
+
+        def tap(codes):
+            orig_tap(codes)
+            with open(cu.keymap_state_paths()[1]) as fh:
+                seen.append(json.load(fh)["keys"])
+        xd.tap = tap
+        xd.type_text("é")
+        self.assertEqual(seen[0], {"201": [[0xE9, 0xE9], [0xE9, 0, 0xE9]]})
+
+    def test_scratch_row_matches(self):
+        m = cu.scratch_row_matches
+        self.assertTrue(m((0xE9, 0, 0xE9, 0), (0xE9, 0xE9)))
+        self.assertTrue(m((0xE9, 0xE9, 0xE9, 0xE9), (0xE9, 0xE9)))
+        self.assertFalse(m((0, 0xE9), (0xE9, 0xE9)))
+        self.assertFalse(m((0xE9, 0xC9), (0xE9, 0xE9)))
+        self.assertTrue(m((0xE9, 0xC9, 0), (0xE9, 0xC9)))  # exact readback
+
+    def test_stale_scratch_key_is_not_typed_directly(self):
+        rows, direct = self.layout()
+        rows[201] = (0xE9, 0xE9)  # stale entry from a killed run ...
+        direct[0xE9] = (201, False)  # ... still in Xlib's cached XKB map
+        self.write_journal({"201": [[0xE9, 0xE9]]})
+        xd = FakeKeymapDisplay(rows, direct)
+        xd.type_text("éç")
+        typed = [e[2][0][0] for e in xd.log if e[0] == "tap"]
+        self.assertEqual(typed, [0xE9, 0xE7])
+        self.assertFalse(cu.row_signature(xd.rows[200]) | cu.row_signature(xd.rows[201]))
+
+    def test_rejects_journal_that_is_not_private(self):
+        rows, direct = self.layout()
+        self.write_journal({"38": [[0x61, 0x41]]}, mode=0o644)
+        xd = FakeKeymapDisplay(rows, direct)
+        with self.assertRaises(cu.CuError) as cm:
+            xd.type_text("é")
+        self.assertEqual(cm.exception.code, "keymap_lock")
+        self.assertEqual(xd.log, [])
+
+    def test_conflict_between_batches_stops_without_overwriting(self):
+        rows, direct = self.layout(empty=(200,))
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_tap = xd.tap
+
+        def tap(codes):
+            orig_tap(codes)
+            xd.rows[200] = (0x20AC, 0x20AC)
+        xd.tap = tap
+        with self.assertRaises(cu.CuError) as cm:
+            xd.type_text("éç")
+        self.assertEqual(cm.exception.code, "keymap_conflict")
+        self.assertEqual(xd.rows[200], (0x20AC, 0x20AC))
+
+    def test_stale_level_in_xkb_cache_is_not_trusted(self):
+        rows, direct = self.layout()
+        rows[11] = (0x42, 0x62)  # core map now has B unshifted, b shifted ...
+        direct[0x62] = (11, False)  # ... but the XKB cache still says b is unshifted
+        xd = FakeKeymapDisplay(rows, direct)
+        xd.type_text("b")
+        taps = [e for e in xd.log if e[0] == "tap"]
+        self.assertEqual(len(taps), 1)
+        self.assertNotEqual(taps[0][1], (11,))  # never the stale unshifted key, which now gives "B"
+        self.assertIn(0x62, taps[0][2][-1])
+
+    def test_rejected_remap_keeps_journal(self):
+        rows, direct = self.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_set = xd.set_keycode_row
+
+        def set_row(kc, row):
+            orig_set(kc, row)
+            xd._errors.append(True)
+        xd.set_keycode_row = set_row
+        with self.assertRaises(cu.CuError) as cm:
+            xd.type_text("é")
+        self.assertEqual(cm.exception.code, "keymap_change_failed")
+        with open(cu.keymap_state_paths()[1]) as fh:
+            self.assertEqual(json.load(fh)["keys"], {"201": [[0xE9, 0xE9]]})
+
+    def test_fifo_journal_does_not_block(self):
+        os.mkfifo(cu.keymap_state_paths()[1], 0o600)
+        rows, direct = self.layout()
+        with self.assertRaises(cu.CuError) as cm:
+            FakeKeymapDisplay(rows, direct).type_text("é")
+        self.assertEqual(cm.exception.code, "keymap_lock")
+
+    def test_interrupt_during_remap_is_recoverable(self):
+        rows, direct = self.layout(empty=(200,))
+        xd = FakeKeymapDisplay(rows, direct)
+        orig_set = xd.set_keycode_row
+        calls = []
+
+        def set_row(kc, row):
+            calls.append(row)
+            if len(calls) == 2:  # second batch: journal written, X not yet changed
+                raise KeyboardInterrupt
+            orig_set(kc, row)
+        xd.set_keycode_row = set_row
+        with self.assertRaises(KeyboardInterrupt):
+            xd.type_text("éç")
+        self.assertFalse(cu.row_signature(xd.rows[200]))
+        with open(cu.keymap_state_paths()[1]) as fh:
+            self.assertEqual(json.load(fh)["keys"], {})
