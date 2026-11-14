@@ -45,14 +45,26 @@ remote-desktop tool or a cross-platform input library.
   not that the app reacted. After navigating, run `cu wait 1`, take a new
   screenshot and wait again if it still shows loading. Smooth scrolling may
   also need a short wait.
-- **Keyboard layout.** `type` looks characters up in the first keyboard
-  group only, on the plain and Shift levels. Those characters are typed
-  directly. Anything else, including AltGr characters, is entered with
-  Ctrl+Shift+U plus hex digits. That works in GTK/IBus apps such as
-  Firefox but not in every toolkit or terminal. If a different keyboard
-  group (a second layout) is active, or Caps Lock or another locked
-  modifier is on, the typed text can be wrong. A plain US layout is the
-  most reliable.
+- **Keyboard layout and Unicode.** `type` types characters found on the
+  plain or Shift level of the first keyboard layout directly. Any other
+  character (accents, AltGr symbols, other scripts, emoji) is typed by
+  briefly binding it to an unused keycode, pressing that key, and then
+  resetting the keycode, the same technique xdotool uses. This changes the
+  shared X keymap for a moment. A display-scoped lock keeps two `cu`
+  processes from clashing, and if a run is killed the next run restores
+  what it left. Keycodes that another program changed in the meantime are
+  left alone and reported as `keymap_conflicts`. Apps re-read the keymap
+  asynchronously, so `cu` waits briefly around each change; a very slow
+  app could still see the wrong key. The core keymap is restored, but
+  some XKB details of those spare keys may differ afterwards. Whether a
+  character appears also depends on the app and its font, especially for
+  emoji. `type` refuses to start while Shift, Ctrl, Alt, Super or Caps Lock
+  is active or a second layout group is selected, and fails with
+  `no_scratch_keycode` if the layout has no unused keycode. The result
+  reports `remapped_characters`. Long runs of remapped text (a few hundred
+  distinct characters) can upset some window managers: under Openbox the
+  next window stopped receiving keyboard focus. xdotool's remapping does
+  the same, so prefer shorter `type` calls for large non-Latin texts.
 - **`open-tab` is a shortcut, not an API.** It presses Ctrl+T in whatever
   window has focus, types the URL and presses Enter. Check with `cu info`
   that a browser is focused first.
@@ -160,22 +172,26 @@ python3 -m unittest discover -s tests
 
 The unit tests need no display. They cover XWD parsing and PNG output,
 `xprop` parsing, argument and batch validation, JSON errors, and the
-release of held mouse buttons. One test that resolves key names is
+release of held mouse buttons, and the Unicode typing plan and keymap
+restore logic (against an in-memory fake keymap). One test that resolves key names is
 skipped when `$DISPLAY` is unset; it does not send input.
 
 `examples/form.html` is a local page for manual end-to-end checks. Open it
 in a browser, then use `cu` to fill in the fields, tick the checkbox with
 Tab/Space, click Preview and check the result in a screenshot. This has
-been verified on a 1920×1080 X11 desktop with Firefox, including "café"
-typed through Ctrl+Shift+U.
+been verified on a 1920×1080 X11 desktop with Firefox. Unicode typing was
+tested in a Debian 13 VM (Xvfb, Openbox, xterm): accents, symbols, Greek,
+Cyrillic, CJK, emoji, 300 distinct CJK characters, a German layout, Caps
+Lock refusal, concurrent runs, and keymap recovery after SIGTERM and
+SIGKILL.
 
 ## AI usage disclaimer
 
 This project was written almost entirely by AI coding agents. Anthropic's
 Claude wrote the code, tests and documentation. OpenAI's GPT Sol reviewed
 the changes over several rounds, and every finding was fixed. The unit
-tests and a manual Firefox run on one X11 desktop are the only testing
-done. The code has not been audited line by line by a human.
+tests, a manual Firefox run on one X11 desktop and scripted xterm tests in
+a VM are the only testing done. The code has not been audited line by line by a human.
 
 Treat it as experimental software. Read the code before running it on a
 machine that matters, especially since `cu` controls your real mouse,

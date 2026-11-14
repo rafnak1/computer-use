@@ -8,9 +8,13 @@ JSON object on stdout; failures exit nonzero with {"ok": false, "error": ...}.
 import argparse
 import ctypes
 import ctypes.util
+import errno
+import fcntl
 import json
 import os
 import re
+import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -28,6 +32,8 @@ KEY_DELAY = 0.012  # seconds between synthetic key events
 CLICK_INTERVAL = 0.08
 SCROLL_INTERVAL = 0.03
 OPEN_TAB_SETTLE = 0.5
+KEYMAP_SETTLE = 0.05  # seconds for clients to process MappingNotify
+KEYMAP_LOCK_TIMEOUT = 30.0
 
 EXIT_RUNTIME = 1
 EXIT_USAGE = 2
@@ -157,6 +163,297 @@ def char_keysym(ch):
     if 0x20 <= cp <= 0x7E or 0xA0 <= cp <= 0xFF:
         return cp
     return 0x01000000 | cp
+
+
+NO_SYMBOL = 0
+# Core modifier-state bits that would change what a typed key produces.
+BLOCKING_STATE = (("Shift", 0x01), ("Caps Lock", 0x02), ("Control", 0x04),
+                  ("Alt (Mod1)", 0x08), ("Super (Mod4)", 0x40))
+XKB_GROUP_MASK = 0x6000
+
+
+def text_keysyms(text):
+    """Keysyms for literal text; rejects characters no key can produce."""
+    out = []
+    for i, ch in enumerate(text):
+        cp = ord(ch)
+        if ch == "\r":
+            continue
+        if (cp < 0x20 and ch not in "\n\t") or 0x7F <= cp <= 0x9F:
+            raise usage_error("text contains control character U+%04X at index %d" % (cp, i))
+        if 0xD800 <= cp <= 0xDFFF:
+            raise usage_error("text contains an unpaired surrogate U+%04X at index %d" % (cp, i),
+                              "pass valid UTF-8 text")
+        out.append(char_keysym(ch))
+    return out
+
+
+def blocking_state(mask):
+    """Names of active modifiers/groups that would garble typed text."""
+    names = [name for name, bit in BLOCKING_STATE if mask & bit]
+    if mask & XKB_GROUP_MASK:
+        names.append("keyboard group %d" % (((mask & XKB_GROUP_MASK) >> 13) + 1))
+    return names
+
+
+def strip_row(row):
+    """Keysym row without trailing NoSymbol padding."""
+    row = list(row)
+    while row and row[-1] == NO_SYMBOL:
+        row.pop()
+    return tuple(row)
+
+
+def row_signature(row):
+    """The set of keysyms in a row."""
+    return frozenset(ks for ks in row if ks != NO_SYMBOL)
+
+
+def scratch_row_matches(current, recorded):
+    """Whether keycode row `current` is the one we recorded.
+
+    Rows are compared exactly (ignoring trailing NoSymbol). The server (XKB)
+    rewrites core rows we install, e.g. [e, e] reads back as [e, NoSymbol, e];
+    for a recorded install row [ks, ks] we also accept any row that starts
+    with ks and holds nothing but ks, which covers a crash before the
+    server's actual row was read back and journaled.
+    """
+    cur, rec = strip_row(current), strip_row(recorded)
+    if cur == rec:
+        return True
+    return (len(rec) == 2 and rec[0] == rec[1] and bool(cur) and cur[0] == rec[0]
+            and row_signature(cur) == {rec[0]})
+
+
+def core_level_matches(row, level, keysym):
+    """Whether a core keymap row has keysym at group 1, `level` (0 or 1)."""
+    return len(row) > level and row[level] == keysym
+
+
+def find_scratch_keycodes(rows, exclude=()):
+    """Keycodes with no keysyms at all, highest first, minus excluded ones."""
+    return sorted((kc for kc, row in rows.items()
+                   if kc >= 8 and kc not in exclude and not strip_row(row)), reverse=True)
+
+
+def plan_typing(keysyms, direct, capacity):
+    """Split keysyms into batches of (scratch assignment, steps).
+
+    direct maps keysym -> (keycode, needs_shift) for keys on the layout. Other
+    keysyms get a scratch slot; a batch never needs more than `capacity`
+    slots. Steps are ("key", keycode, needs_shift) or ("scratch", slot).
+    """
+    batches, assign, steps = [], [], []
+    for ks in keysyms:
+        if ks in direct:
+            kc, shift = direct[ks]
+            steps.append(("key", kc, shift))
+            continue
+        if ks not in assign:
+            if capacity <= 0:
+                raise CuError("no_scratch_keycode",
+                              "no unused keycode is free to type characters missing from the keyboard layout",
+                              "free a keycode (e.g. remove an unused binding with xmodmap) or type only "
+                              "characters on the current layout")
+            if len(assign) == capacity:
+                batches.append((assign, steps))
+                assign, steps = [], []
+            assign.append(ks)
+        steps.append(("scratch", assign.index(ks)))
+    if steps:
+        batches.append((assign, steps))
+    return batches
+
+
+def keymap_state_paths():
+    """(lock path, journal path) for this user and display."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    tag = re.sub(r"[^A-Za-z0-9.]+", "_", display_name())
+    stem = os.path.join(base, "cu-keymap-%d-%s" % (os.getuid(), tag))
+    return stem + ".lock", stem + ".json"
+
+
+def _check_private_file(fd, path):
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise CuError("keymap_lock", "refusing to use %s: not a private regular file owned by you" % path,
+                      "remove it or set XDG_RUNTIME_DIR to a private directory")
+
+
+class ScratchKeys:
+    """Temporarily bind keysyms to unused keycodes, restoring them afterwards.
+
+    A display-scoped lock serialises cooperating cu processes. A journal next
+    to it records, before every change, each row a keycode may hold, so a run
+    killed mid-typing is cleaned up by the next one. Only keycodes whose
+    current row is one we installed are reset; anything else is reported.
+    """
+
+    def __init__(self, xd):
+        self.xd = xd
+        self.fd = None
+        self.slots = []
+        self.rows = {}
+        self.installed = {}  # keycode -> [rows it may hold because of us]
+        self.conflicts = []
+        self.restore_failed = False
+
+    def __enter__(self):
+        self._lock()
+        try:
+            self._recover()
+            kmin, kmax, width, self.rows = self.xd.keyboard_mapping()
+            self.width = max(width, 2)
+            exclude = self.xd.modifier_keycodes() | self.xd.pressed_keycodes()
+            self.slots = find_scratch_keycodes(self.rows, exclude)
+        except BaseException:
+            self._unlock()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.restore()
+        finally:
+            self._unlock()
+        return False
+
+    # --- lock and journal -----------------------------------------------
+
+    def _lock(self):
+        path, self.journal = keymap_state_paths()
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError as exc:
+            raise CuError("keymap_lock", "cannot open keymap lock %s: %s" % (path, exc.strerror or exc))
+        try:
+            _check_private_file(self.fd, path)
+            deadline = time.monotonic() + KEYMAP_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() > deadline:
+                        raise CuError("keymap_busy", "another cu process is typing on this display",
+                                      "retry when it finishes")
+                    time.sleep(0.05)
+        except BaseException:
+            self._unlock()
+            raise
+
+    def _unlock(self):
+        if self.fd is not None:
+            os.close(self.fd)  # releases the flock
+            self.fd = None
+
+    def _save(self):
+        """Atomically replace the journal with the current candidate rows."""
+        data = json.dumps({"pid": os.getpid(),
+                           "keys": {str(k): [list(r) for r in v] for k, v in self.installed.items()}})
+        fd, tmp = tempfile.mkstemp(prefix=".cu-keymap-", dir=os.path.dirname(self.journal))
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.journal)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _recover(self):
+        try:
+            fd = os.open(self.journal, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise CuError("keymap_lock", "cannot open keymap journal %s: %s" % (self.journal, exc.strerror or exc))
+        try:
+            _check_private_file(fd, self.journal)
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                raw = fh.read()
+        finally:
+            os.close(fd)
+        try:
+            keys = json.loads(raw.decode()).get("keys", {})
+            self.installed = {int(k): [tuple(int(x) for x in r) for r in v] for k, v in keys.items()}
+        except (ValueError, AttributeError, TypeError):
+            self.installed = {}
+        self.restore(settle=False)
+
+    # --- mapping changes ------------------------------------------------
+
+    def _ours(self, kc, current):
+        """Whether keycode kc currently holds nothing or a row we installed."""
+        return (not row_signature(current)
+                or any(scratch_row_matches(current, r) for r in self.installed.get(kc, ())))
+
+    def assign(self, keysyms):
+        """Bind keysyms[i] to self.slots[i]; settles before and after."""
+        if self.installed:
+            time.sleep(KEYMAP_SETTLE)  # let clients translate keys already sent
+        changes = []
+        for i, ks in enumerate(keysyms):
+            kc = self.slots[i]
+            row = tuple([ks, ks] + [NO_SYMBOL] * (self.width - 2))
+            current = self.xd.keycode_row(kc)
+            if not self._ours(kc, current):
+                self.installed.pop(kc, None)
+                self.conflicts.append(kc)
+                raise CuError("keymap_conflict",
+                              "keycode %d was changed by another program while typing" % kc,
+                              "part of the text may have been typed; check and retry", keymap_conflicts=[kc])
+            if not scratch_row_matches(current, row):
+                changes.append((kc, row))
+        if not changes:
+            return
+        for kc, row in changes:  # journal old and new rows before mutating
+            self.installed.setdefault(kc, [])
+            if row not in self.installed[kc]:
+                self.installed[kc].append(row)
+        self._save()
+        before = len(self.xd._errors)
+        for kc, row in changes:
+            self.xd.set_keycode_row(kc, row)
+        self.xd.sync()
+        if len(self.xd._errors) != before:  # keep every candidate row for cleanup
+            raise CuError("keymap_change_failed", "the X server rejected a keyboard mapping change")
+        for kc, row in changes:
+            actual = self.xd.keycode_row(kc)  # the server's rewritten form of our row
+            if not scratch_row_matches(actual, row):
+                if kc not in self.conflicts:
+                    self.conflicts.append(kc)
+                raise CuError("keymap_conflict",
+                              "keycode %d was changed by another program while typing" % kc,
+                              "part of the text may have been typed; check and retry", keymap_conflicts=[kc])
+            self.installed[kc] = [row] if strip_row(actual) == strip_row(row) else [row, tuple(actual)]
+        self._save()
+        time.sleep(KEYMAP_SETTLE)
+
+    def restore(self, settle=True):
+        if not self.installed:
+            return
+        if settle:
+            time.sleep(KEYMAP_SETTLE)
+        before = len(self.xd._errors)
+        for kc, rows in sorted(self.installed.items()):
+            current = self.xd.keycode_row(kc)
+            if not row_signature(current):
+                continue
+            if self._ours(kc, current):
+                self.xd.set_keycode_row(kc, (NO_SYMBOL,) * max(len(current), 2))
+            elif kc not in self.conflicts:
+                self.conflicts.append(kc)  # someone else changed it; leave theirs alone
+        self.xd.sync()
+        if len(self.xd._errors) != before:
+            self.restore_failed = True  # keep the journal so the next run retries
+            return
+        self.installed = {}
+        self._save()
 
 
 def parse_chord(spec):
@@ -302,6 +599,10 @@ def display_hint():
 _X_ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
 
 
+class _XModifierKeymap(ctypes.Structure):
+    _fields_ = [("max_keypermod", ctypes.c_int), ("modifiermap", ctypes.POINTER(ctypes.c_ubyte))]
+
+
 class XDisplay:
     """Thin ctypes wrapper over libX11 + libXtst."""
 
@@ -371,6 +672,15 @@ class XDisplay:
         x.XKeysymToKeycode.restype = cb
         x.XkbKeycodeToKeysym.argtypes = [vp, cb, ci, ci]
         x.XkbKeycodeToKeysym.restype = ul
+        x.XDisplayKeycodes.argtypes = [vp, P(ci), P(ci)]
+        x.XGetKeyboardMapping.argtypes = [vp, cu, ci, P(ci)]
+        x.XGetKeyboardMapping.restype = P(ul)
+        x.XChangeKeyboardMapping.argtypes = [vp, ci, ci, P(ul), ci]
+        x.XGetModifierMapping.argtypes = [vp]
+        x.XGetModifierMapping.restype = P(_XModifierKeymap)
+        x.XFreeModifiermap.argtypes = [P(_XModifierKeymap)]
+        x.XQueryKeymap.argtypes = [vp, ctypes.c_char * 32]
+        x.XFree.argtypes = [vp]
         x.XQueryPointer.argtypes = [vp, ul, P(ul), P(ul), P(ci), P(ci), P(ci), P(ci), P(cu)]
         x.XQueryPointer.restype = ci
         x.XGetGeometry.argtypes = [vp, ul, P(ul), P(ci), P(ci), P(cu), P(cu), P(cu), P(cu)]
@@ -517,35 +827,105 @@ class XDisplay:
     def press_chord(self, spec):
         self.tap(self.resolve_chord(spec))
 
+    def keycode_range(self):
+        kmin, kmax = ctypes.c_int(), ctypes.c_int()
+        self.x11.XDisplayKeycodes(self.dpy, ctypes.byref(kmin), ctypes.byref(kmax))
+        return kmin.value, kmax.value
+
+    def keyboard_mapping(self, first=None, count=None):
+        """(min, max, keysyms_per_keycode, {keycode: row}) from the core keymap."""
+        kmin, kmax = self.keycode_range()
+        first = kmin if first is None else first
+        count = kmax - first + 1 if count is None else count
+        width = ctypes.c_int()
+        ptr = self.x11.XGetKeyboardMapping(self.dpy, first, count, ctypes.byref(width))
+        if not ptr:
+            raise CuError("keymap_unavailable", "cannot read the keyboard mapping")
+        try:
+            w = width.value
+            rows = {first + i: tuple(ptr[i * w + j] for j in range(w)) for i in range(count)}
+        finally:
+            self.x11.XFree(ptr)
+        return kmin, kmax, w, rows
+
+    def keycode_row(self, kc):
+        return self.keyboard_mapping(kc, 1)[3][kc]
+
+    def set_keycode_row(self, kc, row):
+        arr = (ctypes.c_ulong * len(row))(*row)
+        self.x11.XChangeKeyboardMapping(self.dpy, kc, len(row), arr, 1)
+
+    def modifier_keycodes(self):
+        mm = self.x11.XGetModifierMapping(self.dpy)
+        if not mm:
+            return set()
+        try:
+            n = mm.contents.max_keypermod * 8
+            return {mm.contents.modifiermap[i] for i in range(n)} - {0}
+        finally:
+            self.x11.XFreeModifiermap(mm)
+
+    def pressed_keycodes(self):
+        buf = (ctypes.c_char * 32)()
+        self.x11.XQueryKeymap(self.dpy, buf)
+        return {i * 8 + b for i, byte in enumerate(buf.raw) for b in range(8) if byte & (1 << b)}
+
+    def modifier_mask(self):
+        root, child = ctypes.c_ulong(), ctypes.c_ulong()
+        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        mask = ctypes.c_uint()
+        self.x11.XQueryPointer(self.dpy, self.root, ctypes.byref(root), ctypes.byref(child),
+                               ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(wx),
+                               ctypes.byref(wy), ctypes.byref(mask))
+        return mask.value
+
+    def direct_keysyms(self, rows):
+        """keysym -> (keycode, needs_shift) for group 1, levels 1-2.
+
+        Uses the XKB view, but only keeps keys whose freshly read core row
+        (`rows`, columns 0-1 = group 1 levels 1-2) agrees at the same level:
+        Xlib's cached XKB map can lag behind a recent mapping change.
+        """
+        found = {}
+        for level in (0, 1):
+            for kc in sorted(rows):
+                ks = self.x11.XkbKeycodeToKeysym(self.dpy, kc, 0, level)
+                if ks and ks not in found and core_level_matches(rows[kc], level, ks):
+                    found[ks] = (kc, bool(level))
+        return found
+
     def type_text(self, text):
+        """Type literal text; returns {"remapped_characters": n, ...}."""
+        keysyms = text_keysyms(text)
+        if not keysyms:
+            return {"remapped_characters": 0}
+        active = blocking_state(self.modifier_mask())
+        if active:
+            raise CuError("keyboard_state", "cannot type reliably while %s is active" % ", ".join(active),
+                          "release held modifiers, turn off Caps Lock (cu key Caps_Lock) "
+                          "and switch to the first keyboard layout")
         shift_kc = self.keycode_levels(SHIFT_KEYSYM)[0]
-        ctrl_kc = self.keycode_levels(CONTROL_KEYSYM)[0]
-        u_kc = self.keycode_levels(ord("u"))[0]
-        space_kc = self.keycode_levels(ord(" "))[0]
-        plan = []
-        unicode_chars = 0
-        for ch in text:
-            if ch == "\r":
-                continue
-            ks = char_keysym(ch)
-            kc, needs_shift = self.keycode_levels(ks)
-            if kc and (needs_shift or self.x11.XkbKeycodeToKeysym(self.dpy, kc, 0, 0) == ks):
-                plan.append([shift_kc, kc] if needs_shift else [kc])
-                continue
-            # Ctrl+Shift+U <hex> <space> (GTK / IBus style Unicode entry)
-            if not (ctrl_kc and shift_kc and u_kc and space_kc):
-                raise CuError("key_unmapped", "cannot type %r in this keyboard layout" % ch)
-            unicode_chars += 1
-            plan.append([ctrl_kc, shift_kc, u_kc])
-            for digit in "%x" % ord(ch):
-                dkc, dshift = self.keycode_levels(ord(digit))
-                if not dkc:
-                    raise CuError("key_unmapped", "cannot type hex digit %r" % digit)
-                plan.append([shift_kc, dkc] if dshift else [dkc])
-            plan.append([space_kc])
-        for codes in plan:
-            self.tap(codes)
-        return unicode_chars
+        result = {"remapped_characters": 0}
+        # Lock and recover first so the layout scan never sees stale scratch keys.
+        with ScratchKeys(self) as scratch:
+            direct = self.direct_keysyms(scratch.rows)
+            if not shift_kc:
+                direct = {ks: v for ks, v in direct.items() if not v[1]}
+            batches = plan_typing(keysyms, direct, len(scratch.slots))  # preflight before any input
+            for assign, steps in batches:
+                if assign:
+                    scratch.assign(assign)
+                for step in steps:
+                    if step[0] == "key":
+                        self.tap([shift_kc, step[1]] if step[2] else [step[1]])
+                    else:
+                        self.tap([scratch.slots[step[1]]])
+                        result["remapped_characters"] += 1
+        if scratch.conflicts:
+            result["keymap_conflicts"] = scratch.conflicts
+        if scratch.restore_failed:
+            result["keymap_restore_failed"] = True  # retried by the next type
+        return result
 
     # --- pointer -----------------------------------------------------------
 
@@ -730,6 +1110,7 @@ def _v_open_tab(p):
     url = _require(p, "url", _nonempty_str, "a non-empty string")
     if any(c in url for c in "\r\n"):
         raise usage_error("url must not contain newlines")
+    text_keysyms(url)
     return {"url": url}
 
 
@@ -745,6 +1126,7 @@ def _v_type(p):
         raise usage_error("text must not be empty")
     if len(text) > MAX_TEXT_LENGTH:
         raise usage_error("text is longer than %d characters" % MAX_TEXT_LENGTH, "split it into several type actions")
+    text_keysyms(text)  # reject untypeable characters before any input is sent
     return {"text": text}
 
 
@@ -859,10 +1241,9 @@ class Session:
             self.xd.press_chord(p["keys"])
             result["keys"] = p["keys"]
         elif action == "type":
-            n = self.xd.type_text(p["text"])
+            typed = self.xd.type_text(p["text"])
             result["characters"] = len(p["text"])
-            if n:
-                result["unicode_via_ctrl_shift_u"] = n
+            result.update(typed)
         elif action == "click":
             self.check_point(p["x"], p["y"])
             self.xd.move(p["x"], p["y"])
@@ -952,7 +1333,7 @@ def build_parser():
     p.add_argument("url")
     p = sub.add_parser("key", help="send a key chord such as ctrl+l, alt+Left, Return")
     p.add_argument("keys")
-    p = sub.add_parser("type", help="type literal text (US ASCII directly, other Unicode via Ctrl+Shift+U)")
+    p = sub.add_parser("type", help="type literal text (any Unicode; characters missing from the layout use a temporary keymap entry)")
     p.add_argument("text")
     p = sub.add_parser("click", help="click at desktop pixel X Y")
     p.add_argument("x", type=int)
@@ -979,8 +1360,17 @@ def emit(obj):
     sys.stdout.flush()
 
 
+def _interrupt(signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
     parser = build_parser()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _interrupt)  # run cleanup (key release, keymap restore)
+        except (ValueError, OSError):
+            pass
     try:
         args = parser.parse_args(argv)
         if not args.command:
