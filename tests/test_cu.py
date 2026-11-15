@@ -126,7 +126,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_valid_defaults(self):
         self.assertEqual(cu.validate_action({"action": "click", "x": 1, "y": 2}),
-                         {"action": "click", "x": 1, "y": 2, "button": "left", "count": 1})
+                         {"action": "click", "x": 1, "y": 2, "button": "left", "count": 1, "hover": 0.15})
         self.assertEqual(cu.validate_action({"action": "scroll", "direction": "down"})["amount"], 3)
 
     def test_invalid(self):
@@ -147,6 +147,27 @@ class ValidationTests(unittest.TestCase):
         self.bad({"action": []})
         self.bad({"action": "scroll", "direction": []})
         self.bad({"action": "click", "x": 1, "y": 2, "button": {}})
+        self.bad({"action": "click", "x": 1, "y": 2, "hover": -0.1})
+        self.bad({"action": "click", "x": 1, "y": 2, "hover": 5.01})
+        self.bad({"action": "click", "x": 1, "y": 2, "hover": float("nan")})
+        self.bad({"action": "click", "x": 1, "y": 2, "hover": True})
+        self.bad({"action": "click", "x": 1, "y": 2, "hover": "0.2"})
+
+    def test_click_hover_values(self):
+        def hover(v):
+            return cu.validate_action({"action": "click", "x": 1, "y": 2, "hover": v})["hover"]
+        self.assertEqual(hover(0), 0.0)
+        self.assertIsInstance(hover(0), float)
+        self.assertEqual(hover(5), 5.0)
+        self.assertEqual(hover(0.3), 0.3)
+        self.assertEqual(hover(None), cu.DEFAULT_HOVER)
+
+    def test_cli_click_hover_is_validated(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cu.main(["click", "1", "2", "--hover", "9"])
+        self.assertEqual(code, cu.EXIT_USAGE)
+        self.assertIn("hover", json.loads(buf.getvalue())["error"]["message"])
 
     def test_default_screenshot_paths_are_unique(self):
         a, b = cu.default_screenshot_path(), cu.default_screenshot_path()
@@ -647,3 +668,61 @@ class ScratchTypingTests(KeymapTestBase):
         self.assertFalse(cu.row_signature(xd.rows[200]))
         with open(cu.keymap_state_paths()[1]) as fh:
             self.assertEqual(json.load(fh)["keys"], {})
+
+
+class ClickHoverTests(unittest.TestCase):
+    """The click runner with a fake display: when it pauses, and what it reports."""
+
+    class FakePointerDisplay:
+        width, height = 100, 100
+
+        def __init__(self, at, log):
+            self.at, self.log = dict(at), log
+
+        def pointer(self):
+            return dict(self.at)
+
+        def move(self, x, y):
+            self.at = {"x": x, "y": y}
+            self.log.append(("move", x, y))
+
+        def button(self, number, count=1):
+            self.log.append(("button", number, count))
+
+    def click(self, start, **fields):
+        log = []
+        session = cu.Session()
+        session._xd = self.FakePointerDisplay(start, log)
+        params = cu.validate_action(dict({"action": "click", "x": 10, "y": 20}, **fields))
+        with unittest.mock.patch.object(cu.time, "sleep", side_effect=lambda s: log.append(("sleep", s))):
+            result = session.run(params)
+        return result, log
+
+    def test_default_hover_pauses_between_move_and_press(self):
+        result, log = self.click({"x": 0, "y": 0})
+        self.assertEqual(log, [("move", 10, 20), ("sleep", cu.DEFAULT_HOVER), ("button", 1, 1)])
+        self.assertEqual(result["hover"], cu.DEFAULT_HOVER)
+
+    def test_custom_hover(self):
+        result, log = self.click({"x": 0, "y": 0}, hover=0.4)
+        self.assertEqual(log[1], ("sleep", 0.4))
+        self.assertEqual(result["hover"], 0.4)
+
+    def test_hover_zero_keeps_old_short_settle(self):
+        result, log = self.click({"x": 0, "y": 0}, hover=0)
+        self.assertEqual(log, [("move", 10, 20), ("sleep", cu.CLICK_SETTLE), ("button", 1, 1)])
+        self.assertEqual(result["hover"], 0.0)
+
+    def test_pointer_already_on_target_skips_hover(self):
+        result, log = self.click({"x": 10, "y": 20}, hover=2)
+        self.assertEqual(log, [("move", 10, 20), ("sleep", cu.CLICK_SETTLE), ("button", 1, 1)])
+        self.assertEqual(result["hover"], 0.0)
+
+    def test_repeated_click_on_same_spot_pauses_once(self):
+        log = []
+        session = cu.Session()
+        session._xd = self.FakePointerDisplay({"x": 0, "y": 0}, log)
+        params = cu.validate_action({"action": "click", "x": 10, "y": 20})
+        with unittest.mock.patch.object(cu.time, "sleep", side_effect=lambda s: log.append(("sleep", s))):
+            hovers = [session.run(params)["hover"] for _ in range(2)]
+        self.assertEqual(hovers, [cu.DEFAULT_HOVER, 0.0])

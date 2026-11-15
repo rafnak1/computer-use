@@ -74,7 +74,7 @@ remote-desktop tool or a cross-platform input library.
 - **Synthetic input.** Events go through the XTEST extension. Some apps,
   games or security prompts may ignore or treat that input differently.
 - **Limits:** wait 0–60 s, scroll 1–50 ticks per call, click count 1–5,
-  text up to 10,000 characters per call.
+  click hover 0–5 s, text up to 10,000 characters per call.
 
 ## Safety
 
@@ -121,7 +121,7 @@ cu screenshot /tmp/before.png
 cu open-tab https://example.com
 cu key ctrl+f
 cu type example
-cu click 500 300 [--button left|middle|right] [--count N]
+cu click 500 300 [--button left|middle|right] [--count N] [--hover SECONDS]
 cu move 500 300
 cu scroll down 3
 cu wait 1
@@ -135,6 +135,13 @@ cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
   `Return`. Unknown key names are rejected before any key is pressed.
 - `type` sends literal text and does not touch the clipboard. Use `key` for
   shortcuts.
+- `click` moves the pointer to the target and rests there for `--hover`
+  seconds (default 0.15, max 5) before pressing, because many menus,
+  dropdowns, date pickers and browser tabs ignore a click that arrives
+  right after the pointer does. `--hover 0` clicks at once. The pause is
+  skipped when the pointer is already at the target, so repeated clicks on
+  one spot stay fast. The result reports the `hover` actually used (`0`
+  when skipped).
 - `scroll` sends wheel ticks at the current pointer position, so move over
   the target panel first.
 
@@ -142,8 +149,8 @@ cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
 
 A batch is a JSON array (or `{"actions": [...]}`) of these actions: `info`;
 `observe`/`screenshot` with optional `path`; `open-tab` with `url`; `key`
-with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`
-and `count`; `move` with `x`, `y`; `scroll` with `direction` and optional
+with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`,
+`count` and `hover` (seconds); `move` with `x`, `y`; `scroll` with `direction` and optional
 `amount`; `wait` with `seconds`.
 
 ```json
