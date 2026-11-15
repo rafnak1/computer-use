@@ -28,6 +28,9 @@ MAX_WAIT_SECONDS = 60.0
 MAX_SCROLL_TICKS = 50
 MAX_CLICK_COUNT = 5
 MAX_TEXT_LENGTH = 10000
+MAX_HOVER_SECONDS = 5.0
+DEFAULT_HOVER = 0.15  # pause over the target before clicking (menus, pickers, tabs)
+CLICK_SETTLE = 0.03  # minimum gap between the move and the press
 KEY_DELAY = 0.012  # seconds between synthetic key events
 CLICK_INTERVAL = 0.08
 SCROLL_INTERVAL = 0.03
@@ -43,6 +46,7 @@ quick start:
   cu info                         focused window, display size, pointer
   cu observe /tmp/state.png       info + screenshot in one call
   cu click 500 300                left click at desktop pixel (500, 300)
+                                  (hovers %(hover)g s first; --hover 0 clicks at once)
   cu type "hello"                 literal text (clipboard untouched)
   cu key ctrl+l                   key chord
   cu scroll down 3                wheel ticks at the current pointer
@@ -81,7 +85,7 @@ batch JSON (array of objects, run in order, stop on first failure):
   {"action":"open-tab", "url":"https://example.com"}
   {"action":"key", "keys":"ctrl+f"}
   {"action":"type", "text":"example"}
-  {"action":"click", "x":500, "y":300, "button":"left", "count":1}
+  {"action":"click", "x":500, "y":300, "button":"left", "count":1, "hover":%(hover)g}
   {"action":"move", "x":500, "y":300}
   {"action":"scroll", "direction":"down", "amount":3}
   {"action":"wait", "seconds":0.5}
@@ -89,9 +93,11 @@ batch JSON (array of objects, run in order, stop on first failure):
 
 limits:
   wait 0..%(wait)g s, scroll 1..%(scroll)d ticks, click count 1..%(clicks)d,
-  text up to %(text)d characters. No DOM, OCR or page-load detection.
+  click hover 0..%(max_hover)g s, text up to %(text)d characters.
+  No DOM, OCR or page-load detection.
 """ % {"wait": MAX_WAIT_SECONDS, "scroll": MAX_SCROLL_TICKS,
-       "clicks": MAX_CLICK_COUNT, "text": MAX_TEXT_LENGTH}
+       "clicks": MAX_CLICK_COUNT, "text": MAX_TEXT_LENGTH,
+       "hover": DEFAULT_HOVER, "max_hover": MAX_HOVER_SECONDS}
 
 
 class CuError(Exception):
@@ -1140,6 +1146,8 @@ def _v_click(p):
     out["button"] = _optional(p, "button", lambda v: isinstance(v, str) and v in BUTTONS, "one of left, middle, right", "left")
     out["count"] = _optional(p, "count", lambda v: _is_int(v) and 1 <= v <= MAX_CLICK_COUNT,
                              "an integer from 1 to %d" % MAX_CLICK_COUNT, 1)
+    out["hover"] = float(_optional(p, "hover", lambda v: _is_number(v) and v == v and 0 <= v <= MAX_HOVER_SECONDS,
+                                   "a number of seconds from 0 to %g" % MAX_HOVER_SECONDS, DEFAULT_HOVER))
     return out
 
 
@@ -1163,7 +1171,7 @@ VALIDATORS = {
     "open-tab": ({"url"}, _v_open_tab),
     "key": ({"keys"}, _v_key),
     "type": ({"text"}, _v_type),
-    "click": ({"x", "y", "button", "count"}, _v_click),
+    "click": ({"x", "y", "button", "count", "hover"}, _v_click),
     "move": ({"x", "y"}, _v_point),
     "scroll": ({"direction", "amount"}, _v_scroll),
     "wait": ({"seconds"}, _v_wait),
@@ -1246,10 +1254,15 @@ class Session:
             result.update(typed)
         elif action == "click":
             self.check_point(p["x"], p["y"])
+            # Hover-sensitive widgets need the pointer over them for a moment;
+            # skip the pause when it is already there (repeated clicks).
+            hover = p["hover"]
+            if self.xd.pointer() == {"x": p["x"], "y": p["y"]}:
+                hover = 0.0
             self.xd.move(p["x"], p["y"])
-            time.sleep(0.03)
+            time.sleep(max(hover, CLICK_SETTLE))
             self.xd.button(BUTTONS[p["button"]], p["count"])
-            result.update({"x": p["x"], "y": p["y"], "button": p["button"], "count": p["count"]})
+            result.update({"x": p["x"], "y": p["y"], "button": p["button"], "count": p["count"], "hover": hover})
         elif action == "move":
             self.check_point(p["x"], p["y"])
             self.xd.move(p["x"], p["y"])
@@ -1340,6 +1353,9 @@ def build_parser():
     p.add_argument("y", type=int)
     p.add_argument("--button", choices=sorted(BUTTONS), default="left")
     p.add_argument("--count", type=int, default=1, help="1=single, 2=double, 3=triple")
+    p.add_argument("--hover", type=float, metavar="SECONDS",
+                   help="pause over the target before pressing (default %g, max %g; 0 = click at once; "
+                        "skipped when the pointer is already there)" % (DEFAULT_HOVER, MAX_HOVER_SECONDS))
     p = sub.add_parser("move", help="move the pointer to X Y")
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
