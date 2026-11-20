@@ -878,3 +878,357 @@ class ClipboardTests(unittest.TestCase):
             self.assertEqual(os.listdir(d), ["c.txt"])
             code, out = self.run_clipboard(["clipboard", "--out", os.path.join(d, "missing", "c.txt")])
             self.assertEqual((code, out["error"]["code"]), (cu.EXIT_RUNTIME, "bad_path"))
+
+
+def frame(rows, bypp=4):
+    """A wait frame from a list of rows of pixel ints."""
+    h, w = len(rows), len(rows[0])
+    data = b"".join(b"".join(v.to_bytes(bypp, "little") for v in row) for row in rows)
+    return {"layout": (w, h, bypp, w * bypp), "pixels": data}
+
+
+class FakeProbe:
+    """Scripted window/selection/frame values; the last value repeats."""
+
+    def __init__(self, windows=(), frames=(), selections=()):
+        self.windows, self.frames, self.selections = list(windows), list(frames), list(selections)
+        self.calls = []
+
+    @staticmethod
+    def _next(values):
+        return values.pop(0) if len(values) > 1 else values[0]
+
+    def window(self):
+        self.calls.append("window")
+        wid, title = self._next(self.windows)
+        return {"window": wid, "title": title}
+
+    def frame(self):
+        self.calls.append("frame")
+        return self._next(self.frames)
+
+    def selection(self, name, base=None):
+        self.calls.append(("selection", name))
+        return dict(self._next(self.selections))
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t = round(self.t + s, 6)  # avoid float drift in poll counts
+
+
+def sel(owner=1, timestamp=None, digest=None, length=None):
+    return {"owner": owner, "timestamp": timestamp, "digest": digest, "length": length}
+
+
+class WaitConditionTests(unittest.TestCase):
+    def cond(self, spec, **fields):
+        return cu.validate_action(dict({"action": "wait", "until": spec}, **fields))["until"]
+
+    def wait(self, cond, probe, baseline=None):
+        clock = FakeClock()
+        return cu.wait_until(cond, probe, baseline, clock=clock, sleep=clock.sleep)
+
+    def timeout(self, cond, probe, baseline=None):
+        with self.assertRaises(cu.CuError) as cm:
+            self.wait(cond, probe, baseline)
+        self.assertEqual((cm.exception.code, cm.exception.exit_code), ("wait_timeout", cu.EXIT_RUNTIME))
+        return cm.exception.extra
+
+    def test_parse_conditions(self):
+        self.assertEqual(cu.parse_condition("title-change"), {"name": "title-change"})
+        self.assertEqual(cu.parse_condition("title-contains=a=b"), {"name": "title-contains", "text": "a=b"})
+        self.assertEqual(cu.parse_condition("stable"), {"name": "stable", "seconds": cu.DEFAULT_STABLE_SECONDS})
+        self.assertEqual(cu.parse_condition("stable=2")["seconds"], 2.0)
+        self.assertEqual(cu.parse_condition("clipboard-change")["selection"], "clipboard")
+        self.assertEqual(cu.parse_condition("clipboard-change=primary")["selection"], "primary")
+        for bad in ("", "nope", "title-change=x", "title-contains", "title-contains=", "title-matches=(",
+                    "stable=0", "stable=61", "stable=nan", "stable=x", "clipboard-change=secondary", 3, None):
+            with self.assertRaises(cu.CuError, msg=bad):
+                cu.parse_condition(bad)
+
+    def test_wait_validation(self):
+        self.assertEqual(self.cond("title-change"), {"name": "title-change", "timeout": 10.0})
+        self.assertEqual(self.cond("stable", timeout=2, tolerance=5),
+                         {"name": "stable", "seconds": 0.5, "timeout": 2.0, "tolerance": 5})
+        self.assertEqual(self.cond("title-change", **{"from": "Old"})["from"], {"window": None, "title": "Old"})
+        self.assertEqual(self.cond("window-change", **{"from": "0x1a"})["from"]["window"], 0x1A)
+        self.assertEqual(self.cond("window-change", **{"from": 26})["from"]["window"], 26)
+        bad = [{"seconds": 1, "until": "title-change"}, {}, {"seconds": 1, "timeout": 2},
+               {"until": "title-change", "timeout": 61}, {"until": "title-change", "timeout": -1},
+               {"until": "title-change", "timeout": True}, {"until": "title-change", "tolerance": 1},
+               {"until": "stable", "tolerance": -1}, {"until": "stable", "tolerance": 1.5},
+               {"until": "stable=5", "timeout": 2}, {"until": "stable", "from": "x"},
+               {"until": "window-change", "from": "nope"}, {"until": "title-change", "from": 3},
+               {"until": "title-change", "bogus": 1}]
+        for item in bad:
+            with self.assertRaises(cu.CuError, msg=item):
+                cu.validate_action(dict(item, action="wait"))
+
+    def test_wait_for_on_actions(self):
+        p = cu.validate_action({"action": "key", "keys": "Return", "wait_for": "title-change", "timeout": 3})
+        self.assertEqual(p["wait_for"], {"name": "title-change", "timeout": 3.0})
+        self.assertNotIn("wait_for", cu.validate_action({"action": "key", "keys": "Return"}))
+        for item in ({"action": "key", "keys": "a", "timeout": 3}, {"action": "key", "keys": "a", "wait_for": "x"},
+                     {"action": "info", "wait_for": "title-change"},
+                     {"action": "clipboard", "wait_for": "clipboard-change"},
+                     {"action": "key", "keys": "a", "wait_for": "title-change", "from": "x"}):
+            with self.assertRaises(cu.CuError, msg=item):
+                cu.validate_action(item)
+
+    def test_title_change(self):
+        probe = FakeProbe(windows=[(1, "A"), (1, "A"), (1, "A"), (1, "B")])
+        out = self.wait(self.cond("title-change"), probe)
+        self.assertEqual((out["met"], out["title"], out["from"], out["window"], out["polls"]),
+                         (True, "B", "A", "0x1", 3))
+        self.assertAlmostEqual(out["elapsed"], 0.2)
+
+    def test_baseline_from_before_the_action(self):
+        probe = FakeProbe(windows=[(1, "B")])  # already changed when the wait starts
+        self.assertEqual(self.wait(self.cond("title-change"), probe, {"window": 1, "title": "A"})["polls"], 1)
+        self.assertEqual(probe.calls, ["window"])
+        cond = self.cond("title-change", **{"from": "A"})
+        self.assertTrue(self.wait(cond, FakeProbe(windows=[(1, "B")]), {"window": 1, "title": "B"})["met"])
+
+    def test_timeout_reports_last_value(self):
+        extra = self.timeout(self.cond("title-change", timeout=1), FakeProbe(windows=[(1, "A")]))
+        self.assertEqual((extra["met"], extra["title"], extra["from"], extra["polls"]), (False, "A", "A", 11))
+        self.assertAlmostEqual(extra["elapsed"], 1.0)
+        extra = self.timeout(self.cond("title-change", timeout=0), FakeProbe(windows=[(1, "A")]))
+        self.assertEqual(extra["polls"], 1)
+
+    def test_title_contains_and_matches(self):
+        probe = FakeProbe(windows=[(1, None), (1, "Loading"), (1, "Example Domain — Firefox")])
+        self.assertEqual(self.wait(self.cond("title-contains=Example"), probe)["polls"], 3)
+        probe = FakeProbe(windows=[(1, "Page 1"), (1, "Page 12")])
+        out = self.wait(self.cond("title-matches=Page \\d{2}"), probe)
+        self.assertEqual((out["polls"], out["pattern"]), (2, "Page \\d{2}"))
+        self.timeout(self.cond("title-contains=example", timeout=0.3), FakeProbe(windows=[(1, "Example")]))
+
+    def test_lost_window_title_is_not_a_change(self):
+        probe = FakeProbe(windows=[(1, "A")])
+        lost = {"window": 1, "title": None, "lost": True}
+        probe.window = lambda: dict(lost)
+        self.timeout(self.cond("title-change", timeout=0.2), probe, {"window": 1, "title": "A"})
+        self.assertFalse(cu.condition_met(self.cond("title-contains=A"), None, lost))
+        self.assertTrue(cu.condition_met(self.cond("window-change"), {"window": 2, "title": "A"}, lost))
+
+    def test_regex_overflow_is_a_usage_error(self):
+        with self.assertRaises(cu.CuError) as cm:
+            cu.parse_condition("title-matches=a{4294967296}")
+        self.assertEqual(cm.exception.exit_code, cu.EXIT_USAGE)
+
+    def test_probe_deadline_is_reset(self):
+        probe = FakeProbe(windows=[(1, "A")])
+        probe.deadline = None
+        self.timeout(self.cond("title-change", timeout=0.1), probe)
+        self.assertIsNone(probe.deadline)
+
+    def test_window_change(self):
+        probe = FakeProbe(windows=[(1, "A"), (1, "A"), (2, "Save As")])
+        out = self.wait(self.cond("window-change"), probe)
+        self.assertEqual((out["window"], out["from"], out["title"]), ("0x2", "0x1", "Save As"))
+        out = self.wait(self.cond("window-change"), FakeProbe(windows=[(1, "A"), (None, None)]))
+        self.assertIsNone(out["window"])
+
+    def test_changed_pixels(self):
+        a = frame([[1, 2, 3], [4, 5, 6]])
+        self.assertEqual(cu.changed_pixels(a, frame([[1, 2, 3], [4, 5, 6]]), 0), 0)
+        self.assertEqual(cu.changed_pixels(a, frame([[1, 9, 3], [9, 5, 9]]), 10), 3)
+        self.assertEqual(cu.changed_pixels(a, frame([[9, 9, 9], [9, 9, 9]]), 1), 3)  # stops after a row
+        self.assertEqual(cu.changed_pixels(frame([[1, 2]], 3), frame([[1, 3]], 3), 5), 1)
+        self.assertEqual(cu.changed_pixels(a, frame([[1, 2, 3]]), 100), float("inf"))
+        self.assertEqual(cu.changed_pixels(dict(a, colormap=b"x"), dict(a, colormap=b"y"), 100), float("inf"))
+
+    def test_xwd_frame_skips_row_padding(self):
+        data = make_xwd(3, 2, PIX, pad=4)
+        f = cu.xwd_frame(data)
+        self.assertEqual(f["layout"], (3, 2, 4, 16))
+        pad_at = 105 + 12  # header + name, then the first row's 4 padding bytes
+        g = cu.xwd_frame(data[:pad_at] + b"\x01" * 4 + data[pad_at + 4:])
+        self.assertNotEqual(f["pixels"], g["pixels"])
+        self.assertEqual(cu.changed_pixels(f, g, 0), 0)
+
+    def test_stable(self):
+        still, moved = frame([[0, 0], [0, 0]]), frame([[1, 0], [0, 0]])
+        probe = FakeProbe(frames=[still, moved, still, still])
+        out = self.wait(self.cond("stable"), probe)  # anchors reset at moved and at still again
+        self.assertTrue(out["met"])
+        self.assertGreaterEqual(out["stable_for"], 0.5)
+        self.assertEqual(out["polls"], 8)  # 0.5 s after the last reset at poll 3
+
+    def test_stable_tolerance_and_timeout(self):
+        a, b = frame([[0, 0], [0, 0]]), frame([[1, 0], [0, 0]])
+        blinking = [a, b] * 50
+        extra = self.timeout(self.cond("stable", timeout=2), FakeProbe(frames=list(blinking)))
+        self.assertLess(extra["stable_for"], 0.5)
+        self.assertIn("tolerance", cu.TIMEOUT_HINTS["stable"])
+        out = self.wait(self.cond("stable", tolerance=1), FakeProbe(frames=list(blinking)))
+        self.assertEqual(out["polls"], 6)
+
+    def test_selection_changed(self):
+        self.assertTrue(cu.selection_changed(sel(None), sel(1)))
+        self.assertTrue(cu.selection_changed(sel(1), sel(2)))
+        self.assertTrue(cu.selection_changed(sel(1), sel(None)))
+        self.assertFalse(cu.selection_changed(sel(None), sel(None)))
+        self.assertTrue(cu.selection_changed(sel(1, 5, "x"), sel(1, 6, "x")))  # same text copied again
+        self.assertTrue(cu.selection_changed(sel(1, None, "x"), sel(1, None, "y")))
+        self.assertFalse(cu.selection_changed(sel(1, 5, "x"), sel(1, 5, "x")))
+        self.assertFalse(cu.selection_changed(sel(1, 5, "x"), sel(1, None, None)))  # busy owner: unknown
+
+    def test_clipboard_change(self):
+        probe = FakeProbe(selections=[sel(1, 5, "x"), sel(1, 5, "x"), sel(1, 5, "y", 3)])
+        out = self.wait(self.cond("clipboard-change=primary"), probe)
+        self.assertEqual((out["selection"], out["length"], out["polls"]), ("primary", 3, 2))
+        extra = self.timeout(self.cond("clipboard-change", timeout=0.2), FakeProbe(selections=[sel(7, 5)]))
+        self.assertEqual((extra["owner"], extra["timestamp"]), ("0x7", 5))
+        self.assertEqual(probe.calls, [("selection", "primary")] * 3)
+
+
+class FakeSelectionConn:
+    """SelectionConn stand-in for DesktopProbe.selection."""
+    owner_value, opened = 7, []
+
+    def __init__(self, xd, selection):
+        FakeSelectionConn.opened.append(selection)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def owner(self):
+        return self.owner_value
+
+
+class ProbeSelectionTests(unittest.TestCase):
+    def snapshot(self, base=None, stamp=5, text="héllo"):
+        FakeSelectionConn.opened = []
+        reads = []
+
+        def read(conn, timeout):
+            reads.append(timeout)
+            if isinstance(text, Exception):
+                raise text
+            return "UTF8_STRING", text
+        session = cu.Session()
+        session._xd = object()
+        with unittest.mock.patch.object(cu, "SelectionConn", FakeSelectionConn), \
+                unittest.mock.patch.object(cu, "selection_timestamp", lambda conn, t: stamp), \
+                unittest.mock.patch.object(cu, "read_selection", read):
+            return session.probe.selection("clipboard", base), reads
+
+    def test_full_snapshot(self):
+        state, reads = self.snapshot()
+        self.assertEqual((state["owner"], state["timestamp"], state["length"]), (7, 5, 5))
+        self.assertEqual(len(state["digest"]), 64)
+        self.assertEqual(reads, [cu.SELECTION_PROBE_TIMEOUT])
+
+    def test_skips_text_once_owner_or_timestamp_differ(self):
+        state, reads = self.snapshot(base=sel(8, 5, "d"))
+        self.assertEqual((state["timestamp"], reads, FakeSelectionConn.opened), (None, [], ["CLIPBOARD"]))
+        state, reads = self.snapshot(base=sel(7, 4, "d"))
+        self.assertEqual((state["timestamp"], reads), (5, []))
+        state, reads = self.snapshot(base=sel(7, 5, "d"))
+        self.assertEqual(len(reads), 1)
+
+    def test_unreadable_text(self):
+        state, _ = self.snapshot(text=cu.CuError("clipboard_timeout", "slow"))
+        self.assertEqual((state["owner"], state["digest"]), (7, None))
+
+
+class SessionWaitTests(unittest.TestCase):
+    """Baselines are taken at the action's commit point, before the input is sent."""
+
+    class FakeXd:
+        width, height = 100, 100
+
+        def __init__(self, log):
+            self.log = log
+
+        def press_chord(self, keys):
+            self.log.append(("key", keys))
+
+        def type_text(self, text):
+            self.log.append(("type", text))
+            return {"remapped_characters": 0}
+
+    def session(self, titles):
+        log = []
+        session = cu.Session()
+        session._xd = self.FakeXd(log)
+        titles = list(titles)
+
+        def window():
+            log.append("probe")
+            return {"window": 1, "title": titles.pop(0) if len(titles) > 1 else titles[0]}
+        session.probe.window = window
+        return session, log
+
+    def test_key_wait_for(self):
+        session, log = self.session(["A", "B"])
+        p = cu.validate_action({"action": "key", "keys": "Return", "wait_for": "title-change"})
+        result = session.run(p)
+        self.assertEqual(log, ["probe", ("key", "Return"), "probe"])
+        self.assertEqual((result["wait"]["from"], result["wait"]["title"]), ("A", "B"))
+
+    def test_open_tab_baseline_after_new_tab(self):
+        session, log = self.session(["New Tab", "Example"])
+        p = cu.validate_action({"action": "open-tab", "url": "http://x", "wait_for": "title-change"})
+        with unittest.mock.patch.object(cu.time, "sleep"):
+            result = session.run(p)
+        self.assertEqual(log, [("key", "ctrl+t"), ("type", "http://x"), "probe", ("key", "Return"), "probe"])
+        self.assertEqual(result["wait"]["from"], "New Tab")
+        self.assertNotIn("next", result)
+
+    def test_timeout_keeps_action_result(self):
+        session, log = self.session(["A"])
+        p = cu.validate_action({"action": "key", "keys": "Return", "wait_for": "title-change", "timeout": 0})
+        with self.assertRaises(cu.CuError) as cm:
+            session.run(p)
+        self.assertEqual(cm.exception.extra["action_result"], {"action": "key", "keys": "Return"})
+
+    def test_batch_wait_baseline_before_previous_action(self):
+        log = []
+        titles = ["A", "B"]
+
+        def window(self):
+            log.append("probe")
+            return {"window": 1, "title": titles.pop(0) if len(titles) > 1 else titles[0]}
+
+        class Xd(self.FakeXd):
+            def resolve_chord(self, keys):
+                return [1]
+        batch = [{"action": "key", "keys": "Return"}, {"action": "wait", "until": "title-change"},
+                 {"action": "wait", "until": "title-contains=B"}]
+        with unittest.mock.patch.object(cu.DesktopProbe, "window", window), \
+                unittest.mock.patch.object(cu.Session, "xd", Xd(log)):
+            out, code = cu.run_batch(batch)
+        self.assertEqual(code, 0)
+        self.assertEqual(log, ["probe", ("key", "Return"), "probe", "probe"])
+        self.assertEqual((out["results"][1]["from"], out["results"][1]["title"]), ("A", "B"))
+
+    def test_cli_wait_conditions(self):
+        def item(*argv):
+            return cu.wait_item(cu.build_parser().parse_args(["wait"] + list(argv)))
+        self.assertEqual(item("1"), {"action": "wait", "seconds": 1.0})
+        self.assertEqual(item("--stable"), {"action": "wait", "until": "stable=0.5"})
+        self.assertEqual(item("--stable", "2", "--timeout", "5"), {"action": "wait", "until": "stable=2.0", "timeout": 5.0})
+        self.assertEqual(item("--clipboard-change", "--selection", "primary")["until"], "clipboard-change=primary")
+        self.assertEqual(item("--title-change", "--from", "Old")["from"], "Old")
+        self.assertEqual(item("--title-contains", "a b")["until"], "title-contains=a b")
+        for argv in (["--title-change", "--window-change"], ["--selection", "primary"]):
+            with self.assertRaises(cu.CuError):
+                item(*argv)
+        for argv in (["wait"], ["wait", "1", "--title-change"], ["wait", "--stable", "--tolerance", "1.5"],
+                     ["key", "a", "--wait-for", "stable", "--tolerance", "-1"], ["wait", "--title-contains", ""]):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(cu.main(argv), cu.EXIT_USAGE, argv)
