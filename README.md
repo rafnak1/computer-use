@@ -4,8 +4,9 @@
 
 `cu` is a small command-line tool that lets an AI agent, or a script, drive
 the current X11 desktop. It takes screenshots, reports the focused window,
-moves and clicks the mouse, types text, presses keys, scrolls and reads
-copied text from the clipboard.
+moves and clicks the mouse, types text, presses keys, scrolls, reads
+copied text from the clipboard and waits for the window title, the active
+window, the screen or the clipboard to change.
 Every command prints one JSON object, so agents can parse the result.
 Only `--help`, `--version` and running `cu` with no command print plain
 text.
@@ -23,7 +24,8 @@ desktop:
   class, PID and geometry; display size and pointer position; pointer
   move, click (left/middle/right, single or multi) and wheel scroll; key
   chords; literal text entry; reading text from the clipboard or PRIMARY
-  selection; a browser "open tab" shortcut; timed waits; and JSON batches
+  selection; a browser "open tab" shortcut; timed waits and waits for a
+  title, window, screen or clipboard condition; and JSON batches
   that run several of these in order.
 - **Who it is for:** agents that decide what to do by looking at
   screenshots. Click coordinates are the same native pixels as the
@@ -43,10 +45,12 @@ remote-desktop tool or a cross-platform input library.
 - **No understanding of the screen.** There is no DOM access, OCR,
   accessibility tree or element lookup. The caller has to read the
   screenshots itself.
-- **No load or success detection.** Exit code 0 means the input was sent,
-  not that the app reacted. After navigating, run `cu wait 1`, take a new
-  screenshot and wait again if it still shows loading. Smooth scrolling may
-  also need a short wait.
+- **No real load or success detection.** Exit code 0 means the input was
+  sent, not that the app reacted. [Condition waits](#waiting-for-a-condition)
+  watch indirect signals: the window title (usually set once a page has
+  loaded), the active window, the screen settling, or the clipboard. A
+  title can change before the page finishes drawing, and a page that
+  keeps animating never settles, so take a screenshot to confirm.
 - **Keyboard layout and Unicode.** `type` types characters found on the
   plain or Shift level of the first keyboard layout directly. Any other
   character (accents, AltGr symbols, other scripts, emoji) is typed by
@@ -76,16 +80,16 @@ remote-desktop tool or a cross-platform input library.
   `text/plain;charset=utf-8`, then `STRING`, and supports incremental (INCR)
   transfers for large text, up to 64 MiB. It fails with `clipboard_empty`
   when no app owns the selection and `clipboard_timeout` when the owner stays
-  silent for 3 seconds. Apps take the clipboard asynchronously, so wait
-  briefly after `cu key ctrl+c`; until they do, you read the previous
-  contents. If the app that copied has exited, the clipboard is usually
+  silent for 3 seconds. Apps take the clipboard asynchronously; use
+  `cu key ctrl+c --wait-for clipboard-change`, since until they do you
+  read the previous contents. If the app that copied has exited, the clipboard is usually
   gone too, unless a clipboard manager keeps it.
 - **One screen, full captures.** Screenshots always cover the whole root
   window. There is no per-window or region capture, and with several
   monitors you get a single combined image.
 - **Synthetic input.** Events go through the XTEST extension. Some apps,
   games or security prompts may ignore or treat that input differently.
-- **Limits:** wait 0–60 s, scroll 1–50 ticks per call, click count 1–5,
+- **Limits:** wait and wait timeouts 0–60 s, scroll 1–50 ticks per call, click count 1–5,
   click hover 0–5 s, text up to 10,000 characters per call, clipboard up to
   64 MiB.
 
@@ -143,6 +147,9 @@ cu click 500 300 [--button left|middle|right] [--count N] [--hover SECONDS]
 cu move 500 300
 cu scroll down 3
 cu wait 1
+cu wait --title-change | --title-contains TEXT | --title-matches REGEX | --window-change
+        | --stable [SECONDS] | --clipboard-change [--timeout SECONDS]
+cu key Return --wait-for title-change       # any input action + a condition
 cu clipboard [--selection clipboard|primary] [--out FILE]
 cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
 ```
@@ -170,13 +177,71 @@ cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
   the output small for long pages. `--selection primary` reads the last
   selected text instead of the last copied text.
 
+### Waiting for a condition
+
+Instead of guessing a sleep, wait until something observable happens.
+`cu wait` polls every 0.1 s until its condition is met or `--timeout`
+(default 10 s, max 60 s) runs out:
+
+| Condition | Done when |
+|---|---|
+| `--title-change` | the active window's title differs from the starting title |
+| `--title-contains TEXT`, `--title-matches REGEX` | the active window's title contains TEXT, or `re.search` finds REGEX |
+| `--window-change` | another window is active (a dialog, a new window, or none) |
+| `--stable [SECONDS]` | the screen has not changed for SECONDS (default 0.5) |
+| `--clipboard-change` | the clipboard (or `--selection primary`) has a new owner, a new TIMESTAMP or new text |
+
+```json
+{"ok": true, "action": "wait", "condition": "title-change", "elapsed": 1.84, "polls": 17,
+ "title": "Example Domain — Mozilla Firefox", "window": "0x400003", "from": "Mozilla Firefox", "met": true}
+```
+
+On timeout `cu` exits 1 with error code `wait_timeout`, plus `elapsed`,
+`polls` and the last value seen, so the agent can decide what to do next.
+
+A "change" condition needs a starting value. A separate `cu wait
+--title-change` starts from the title when it begins, so it misses a
+change that already happened. To avoid that race, attach the condition to
+the action with `--wait-for` (`open-tab`, `key`, `type`, `click`, `move` and
+`scroll` take it, along with `--timeout` and `--tolerance`). The starting value is
+recorded before the action runs, or for `open-tab` after the new tab has
+opened and just before Enter:
+
+```sh
+cu open-tab https://example.com --wait-for title-change
+cu key Return --wait-for title-change           # submit a search, next listing
+cu key ctrl+s --wait-for window-change          # "Save As" dialog appeared
+cu key ctrl+c --wait-for clipboard-change       # the app took the clipboard
+cu scroll down 5 --wait-for stable              # smooth scrolling has stopped
+```
+
+`--wait-for` takes `title-change`, `title-contains=TEXT`,
+`title-matches=REGEX`, `window-change`, `stable[=SECONDS]` and
+`clipboard-change[=primary]`. The action's result gets a `wait` object; if
+the wait times out, the error carries the action's result as
+`action_result`. `cu wait --title-change --from "Old title"` (or
+`--window-change --from 0x1a00003`) sets the starting value explicitly.
+
+Notes:
+
+- The title and window come from `xprop`, which runs twice per poll.
+- `--stable` compares raw `xwd` captures without encoding PNGs. Spinners,
+  video, animations and blinking text cursors stop the screen from
+  settling; `--tolerance PIXELS` ignores up to that many changed pixels
+  (compared with the first frame of the quiet period, so slow drift still
+  counts). Each poll captures the whole screen, so on large desktops polls
+  are further apart than 0.1 s.
+- `--clipboard-change` asks the owner for the ICCCM `TIMESTAMP` target, so
+  copying the same text again still counts as a change. With an owner that
+  does not answer `TIMESTAMP`, only a new owner or new text counts.
+
 ### Reading text from the screen
 
 Copying and reading the clipboard is usually faster and more accurate than
 scrolling through screenshots:
 
 ```sh
-cu key ctrl+a; cu key ctrl+c; cu wait 0.3
+cu key ctrl+a; cu key ctrl+c --wait-for clipboard-change
 cu clipboard --out /tmp/page.txt
 ```
 
@@ -186,7 +251,7 @@ For the whole text of a web page in Firefox, use the devtools console
 ```sh
 cu key ctrl+shift+k; cu wait 1
 cu type 'copy(document.body.innerText)'
-cu key Return; cu wait 0.3
+cu key Return --wait-for clipboard-change
 cu key F12                        # close devtools again
 cu clipboard --out /tmp/page.txt
 ```
@@ -200,8 +265,25 @@ A batch is a JSON array (or `{"actions": [...]}`) of these actions: `info`;
 `observe`/`screenshot` with optional `path`; `open-tab` with `url`; `key`
 with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`,
 `count` and `hover` (seconds); `move` with `x`, `y`; `scroll` with `direction` and optional
-`amount`; `wait` with `seconds`; `clipboard` with optional `selection`
-(`clipboard` or `primary`) and `out`.
+`amount`; `wait` with `seconds`, or with `until` (a condition as above)
+and optional `timeout`, `tolerance` and `from`; `clipboard` with optional
+`selection` (`clipboard` or `primary`) and `out`. `open-tab`, `key`, `type`,
+`click`, `move` and `scroll` also take optional `wait_for`, `timeout` and
+`tolerance`.
+
+In a batch, a `wait` with a "change" condition starts from the value
+recorded just before the previous action (for `open-tab`, just before
+Enter), so a change that action caused still counts even if it happened
+before the wait began. A change that reverts before the first poll (a
+dialog that opens and closes at once) is still missed:
+
+```json
+[
+  {"action": "click", "x": 640, "y": 410},
+  {"action": "wait", "until": "title-change", "timeout": 15},
+  {"action": "observe", "path": "/tmp/next.png"}
+]
+```
 
 ```json
 [
@@ -217,8 +299,7 @@ Copy, then read, in one call:
 ```json
 [
   {"action": "key", "keys": "ctrl+a"},
-  {"action": "key", "keys": "ctrl+c"},
-  {"action": "wait", "seconds": 0.3},
+  {"action": "key", "keys": "ctrl+c", "wait_for": "clipboard-change"},
   {"action": "clipboard", "out": "/tmp/page.txt"}
 ]
 ```
@@ -243,7 +324,10 @@ The unit tests need no display. They cover XWD parsing and PNG output,
 release of held mouse buttons, the Unicode typing plan and keymap
 restore logic (against an in-memory fake keymap), and clipboard reading
 (target fallback, INCR assembly, timeouts and size limits against a
-scripted fake selection owner). One test that resolves key names is
+scripted fake selection owner), and condition waits (argument checks,
+baselines before the action and in batches, timeouts, and the title,
+window, frame and clipboard comparisons against fake sources and a fake
+clock). One test that resolves key names is
 skipped when `$DISPLAY` is unset; it does not send input.
 
 `examples/form.html` is a local page for manual end-to-end checks. Open it
@@ -257,7 +341,12 @@ SIGKILL. Clipboard reading was tested in the same VM against a scripted
 selection owner (UTF-8, STRING-only, refusing, silent, and a 1.2 MB INCR
 transfer) and against Firefox ESR: the devtools `copy(document.body.innerText)`
 recipe on a 20,000-row page (553 KB) and Ctrl+A/Ctrl+C with both CLIPBOARD
-and PRIMARY.
+and PRIMARY. Condition waits were tested in the same VM with Openbox and
+Firefox ESR: `open-tab --wait-for title-change`, `--title-contains` on a
+page that sets its title after 2 s, the Save As dialog with
+`--window-change` (single commands and a batch), `--stable` on a static
+and an animated page (timeout, then met with `--tolerance`), and
+`--clipboard-change` after Ctrl+C, including copying the same text again.
 
 ## AI usage disclaimer
 

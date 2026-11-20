@@ -10,6 +10,7 @@ import ctypes
 import ctypes.util
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -40,6 +41,11 @@ KEYMAP_SETTLE = 0.05  # seconds for clients to process MappingNotify
 KEYMAP_LOCK_TIMEOUT = 30.0
 CLIPBOARD_TIMEOUT = 3.0  # seconds the selection owner may stay silent
 MAX_CLIPBOARD_BYTES = 64 * 1024 * 1024
+DEFAULT_WAIT_TIMEOUT = 10.0
+DEFAULT_STABLE_SECONDS = 0.5
+WAIT_POLL_INTERVAL = 0.1
+SELECTION_PROBE_TIMEOUT = 0.5  # per request while polling the clipboard
+MAX_STABLE_TOLERANCE = 10 ** 7
 
 EXIT_RUNTIME = 1
 EXIT_USAGE = 2
@@ -53,8 +59,10 @@ quick start:
   cu type "hello"                 literal text (clipboard untouched)
   cu key ctrl+l                   key chord
   cu scroll down 3                wheel ticks at the current pointer
-  cu wait 1                       let a page load, then observe again
-  cu open-tab https://example.com Ctrl+T, type URL, Enter (focused browser)
+  cu key Return --wait-for title-change   act, then wait for the window title to change
+  cu wait --stable                wait until the screen stops changing
+  cu open-tab https://example.com --wait-for title-change
+                                  Ctrl+T, type URL, Enter (focused browser), wait
   cu clipboard                    read copied text: {"text": ..., "length": N}
   cu batch actions.json           run a JSON action list ("-" = stdin)
 
@@ -77,10 +85,26 @@ access:
   if required, $XAUTHORITY. Sandboxed agents may need escalated permissions
   for desktop commands; the error message says so when the display fails.
 
-timing:
-  Nothing waits for websites or apps to finish. After navigation run
-  `cu wait 1` and observe; wait again if the screenshot shows loading.
-  Smooth scrolling may need a short wait before the final screenshot.
+timing (wait for a condition instead of guessing sleeps):
+  Exit code 0 means the input was sent, not that the app reacted. Conditions
+  are polled every %(poll)g s until met or --timeout (default %(timeout)g s):
+    title-change           the active window's title differs (page loaded,
+                           next listing, "Save As" dialog). Most reliable.
+    title-contains=TEXT    the title contains TEXT (title-matches=REGEX too)
+    window-change          another window became active (dialogs, new windows)
+    stable[=SECONDS]       the screen did not change for SECONDS (default %(stable)g)
+    clipboard-change[=primary]  something new was copied
+  Add one to an input action with --wait-for: the value is recorded before
+  the action (open-tab: just before Enter), so a fast change is not missed:
+    cu key Return --wait-for title-change
+    cu key ctrl+c --wait-for clipboard-change
+    cu click 500 300 --wait-for window-change --timeout 5
+  `cu wait --title-change` alone starts from the current title and misses a
+  change that already happened; `cu wait --title-contains Example` and
+  `cu wait --stable` have no such race. On timeout: exit 1, wait_timeout,
+  with elapsed and the last value seen. Spinners, video and blinking cursors
+  can keep stable from settling: --tolerance PIXELS ignores small changes.
+  A title can change before the page finishes drawing; observe to check.
 
 batch JSON (array of objects, run in order, stop on first failure):
   {"action":"info"}
@@ -93,25 +117,34 @@ batch JSON (array of objects, run in order, stop on first failure):
   {"action":"move", "x":500, "y":300}
   {"action":"scroll", "direction":"down", "amount":3}
   {"action":"wait", "seconds":0.5}
+  {"action":"wait", "until":"title-change", "timeout":10}    or any condition
+     change conditions start from the value before the PREVIOUS action;
+     "from":"Old title" (title-change) or "from":"0x1a00003" (window-change)
+     sets it explicitly; "tolerance":N for stable
   {"action":"clipboard", "selection":"clipboard", "out":"/tmp/c.txt"}  both optional
+  Input actions (open-tab, key, type, click, move, scroll) also accept
+  "wait_for":"title-change", "timeout":10, "tolerance":N.
   Options: cu batch FILE --screenshot /tmp/final.png captures the end state.
 
 reading text (instead of scroll-and-screenshot loops):
-  Select and copy, wait briefly so the app takes the clipboard, then read:
-    cu key ctrl+a; cu key ctrl+c; cu wait 0.3; cu clipboard --out /tmp/page.txt
+  Select and copy, wait until the app takes the clipboard, then read:
+    cu key ctrl+a; cu key ctrl+c --wait-for clipboard-change
+    cu clipboard --out /tmp/page.txt
   Whole page text in Firefox (Chrome: ctrl+shift+j), via the devtools console
   (F12 closes it again):
     cu key ctrl+shift+k; cu wait 1; cu type 'copy(document.body.innerText)'
-    cu key Return; cu wait 0.3; cu key F12; cu clipboard --out /tmp/page.txt
+    cu key Return --wait-for clipboard-change; cu key F12
+    cu clipboard --out /tmp/page.txt
   Check `cu info` first so the keys go to the right window. clipboard_empty
   means nothing is copied; an unchanged clipboard still holds the old text.
 
 limits:
-  wait 0..%(wait)g s, scroll 1..%(scroll)d ticks, click count 1..%(clicks)d,
+  wait and --timeout 0..%(wait)g s, scroll 1..%(scroll)d ticks, click count 1..%(clicks)d,
   click hover 0..%(max_hover)g s, text up to %(text)d characters,
   clipboard up to %(clip)d MiB, owner silent for at most %(clip_timeout)g s.
-  No DOM, OCR or page-load detection.
-""" % {"wait": MAX_WAIT_SECONDS, "scroll": MAX_SCROLL_TICKS,
+  No DOM, OCR or network-idle detection; the title is the best load signal.
+""" % {"wait": MAX_WAIT_SECONDS, "poll": WAIT_POLL_INTERVAL, "timeout": DEFAULT_WAIT_TIMEOUT,
+       "stable": DEFAULT_STABLE_SECONDS, "scroll": MAX_SCROLL_TICKS,
        "clicks": MAX_CLICK_COUNT, "text": MAX_TEXT_LENGTH,
        "hover": DEFAULT_HOVER, "max_hover": MAX_HOVER_SECONDS,
        "clip": MAX_CLIPBOARD_BYTES // (1024 * 1024), "clip_timeout": CLIPBOARD_TIMEOUT}
@@ -526,11 +559,8 @@ def _mask_shift(mask):
     return shift, width
 
 
-def xwd_to_rgb(data):
-    """Parse an XWD (X Window Dump, version 7) ZPixmap image.
-
-    Returns (width, height, list_of_rgb_row_bytes).
-    """
+def _xwd_header(data):
+    """Validated XWD (version 7, ZPixmap) header fields plus pixel offsets."""
     if len(data) < 100:
         raise CuError("screenshot_failed", "xwd output is truncated")
     fields = struct.unpack(">25I", data[:100])
@@ -550,7 +580,49 @@ def xwd_to_rgb(data):
     need = pix_off + bpl * height
     if len(data) < need:
         raise CuError("screenshot_failed", "xwd output is truncated (%d < %d bytes)" % (len(data), need))
+    return (width, height, byte_order, bpp, bpl, vclass, rmask, gmask, bmask,
+            cmap_off, ncolors, pix_off, need)
 
+
+def xwd_frame(data):
+    """Raw pixels of an XWD image for comparison: {"layout": (w, h, bytes/pixel, bytes/line), "pixels"}."""
+    width, height, _bo, bpp, bpl, *_rest, cmap_off, _ncolors, pix_off, need = _xwd_header(data)
+    # The colormap matters on indexed-colour displays, where palette animation keeps pixel values.
+    return {"layout": (width, height, bpp // 8, bpl), "colormap": bytes(data[cmap_off:pix_off]),
+            "pixels": bytes(data[pix_off:need])}
+
+
+def changed_pixels(a, b, limit):
+    """Pixels that differ between frames a and b, counting stops once above limit."""
+    if a["layout"] != b["layout"] or a.get("colormap") != b.get("colormap"):
+        return float("inf")
+    pa, pb = a["pixels"], b["pixels"]
+    if pa == pb:
+        return 0
+    width, height, bypp, bpl = a["layout"]
+    row_len = width * bypp
+    count = 0
+    for y in range(height):
+        o = y * bpl
+        ra, rb = pa[o:o + row_len], pb[o:o + row_len]
+        if ra == rb:
+            continue
+        if bypp == 4:
+            count += sum(1 for p, q in zip(memoryview(ra).cast("I"), memoryview(rb).cast("I")) if p != q)
+        else:
+            count += sum(1 for x in range(0, row_len, bypp) if ra[x:x + bypp] != rb[x:x + bypp])
+        if count > limit:
+            break
+    return count
+
+
+def xwd_to_rgb(data):
+    """Parse an XWD (X Window Dump, version 7) ZPixmap image.
+
+    Returns (width, height, list_of_rgb_row_bytes).
+    """
+    (width, height, byte_order, bpp, bpl, vclass, rmask, gmask, bmask,
+     cmap_off, ncolors, pix_off, need) = _xwd_header(data)
     colormap = {}
     for i in range(ncolors):
         pixel, r, g, b = struct.unpack(">IHHH", data[cmap_off + i * 12: cmap_off + i * 12 + 10])
@@ -1078,6 +1150,21 @@ def read_selection(conn, targets=TEXT_TARGETS, timeout=CLIPBOARD_TIMEOUT, limit=
                   "the copied content may be an image or files; copy text instead")
 
 
+def selection_timestamp(conn, timeout):
+    """When the owner took the selection (ICCCM TIMESTAMP target), or None."""
+    conn.convert("TIMESTAMP")
+    try:
+        _, converted = _wait_event(conn, timeout, lambda ev: ev[0] == "selection")
+    except CuError:
+        return None
+    if not converted:
+        return None
+    _type, fmt, data = conn.get_property(delete=True)
+    if fmt != 32 or not data:
+        return None
+    return int.from_bytes(data[:ctypes.sizeof(ctypes.c_long)], sys.byteorder) & 0xFFFFFFFF
+
+
 class _XSelectionEvent(ctypes.Structure):
     _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
                 ("display", ctypes.c_void_p), ("requestor", ctypes.c_ulong), ("selection", ctypes.c_ulong),
@@ -1146,8 +1233,11 @@ class SelectionConn:
         finally:
             self.x11.XFree(ptr)
 
+    def owner(self):
+        return self.x11.XGetSelectionOwner(self.dpy, self.sel_atom)
+
     def has_owner(self):
-        return bool(self.x11.XGetSelectionOwner(self.dpy, self.sel_atom))
+        return bool(self.owner())
 
     def convert(self, target):
         self.x11.XConvertSelection(self.dpy, self.sel_atom, self.atom(target), self.prop, self.win, 0)
@@ -1337,6 +1427,255 @@ def take_screenshot(path=None):
 
 
 # ---------------------------------------------------------------------------
+# Condition waits
+# ---------------------------------------------------------------------------
+
+WAIT_CONDITIONS = ("title-change", "title-contains", "title-matches", "window-change", "stable",
+                   "clipboard-change")
+BASELINE_CONDITIONS = {"title-change", "window-change", "clipboard-change"}
+CONDITION_SYNTAX = ("title-change, title-contains=TEXT, title-matches=REGEX, window-change, "
+                    "stable[=SECONDS], clipboard-change[=primary]")
+
+
+def parse_condition(spec):
+    """Parse NAME[=VALUE] into a condition dict (timeout etc. are added by the caller)."""
+    if not isinstance(spec, str) or not spec:
+        raise usage_error("wait condition must be a non-empty string", "conditions: " + CONDITION_SYNTAX)
+    name, sep, arg = spec.partition("=")
+    if name not in WAIT_CONDITIONS:
+        raise usage_error("unknown wait condition %r" % name, "conditions: " + CONDITION_SYNTAX)
+    cond = {"name": name}
+    if name in ("title-change", "window-change"):
+        if sep:
+            raise usage_error("%s takes no value" % name)
+    elif name in ("title-contains", "title-matches"):
+        if not arg:
+            raise usage_error("%s needs a value" % name, "example: %s=Example" % name)
+        if name == "title-matches":
+            try:
+                re.compile(arg)
+            except (re.error, OverflowError, ValueError, RecursionError) as exc:
+                raise usage_error("invalid regular expression %r: %s" % (arg, exc))
+        cond["text"] = arg
+    elif name == "stable":
+        seconds = DEFAULT_STABLE_SECONDS
+        if sep:
+            try:
+                seconds = float(arg)
+            except ValueError:
+                seconds = -1.0
+        if not 0 < seconds <= MAX_WAIT_SECONDS:  # also rejects NaN
+            raise usage_error("stable needs a number of seconds above 0 and up to %g" % MAX_WAIT_SECONDS)
+        cond["seconds"] = seconds
+    else:
+        selection = arg if sep else "clipboard"
+        if selection not in SELECTIONS:
+            raise usage_error("clipboard-change takes clipboard or primary")
+        cond["selection"] = selection
+    return cond
+
+
+def parse_baseline(cond, value):
+    """An explicit starting value (`from`) for title-change or window-change."""
+    if cond["name"] == "title-change":
+        if not isinstance(value, str):
+            raise usage_error("field 'from' must be the old title as a string")
+        return {"window": None, "title": value}
+    if cond["name"] == "window-change":
+        wid = None
+        if _is_int(value):
+            wid = value
+        elif isinstance(value, str):
+            try:
+                wid = int(value, 0)
+            except ValueError:
+                pass
+        if wid is None or wid < 0:
+            raise usage_error("field 'from' must be a window id such as 0x1a00003")
+        return {"window": wid or None, "title": None}
+    raise usage_error("'from' only applies to title-change and window-change")
+
+
+class DesktopProbe:
+    """Reads the live values that wait conditions compare."""
+
+    def __init__(self, session):
+        self.session = session
+        self.deadline = None  # set by wait_until; caps how long one probe may block
+
+    def _tool_timeout(self):
+        if self.deadline is None:
+            return 20
+        return max(0.5, self.deadline - time.monotonic() + 0.5)
+
+    def _request_timeout(self):
+        if self.deadline is None:
+            return SELECTION_PROBE_TIMEOUT
+        return max(0.05, min(SELECTION_PROBE_TIMEOUT, self.deadline - time.monotonic()))
+
+    def window(self):
+        wid = parse_active_window(run_tool(["xprop", "-display", display_name(), "-root", "_NET_ACTIVE_WINDOW"],
+                                           timeout=self._tool_timeout()))
+        title = None
+        if wid is not None:
+            try:
+                title = parse_window_props(run_tool(["xprop", "-display", display_name(), "-id", "0x%x" % wid,
+                                                     "_NET_WM_NAME", "WM_NAME"],
+                                                    timeout=self._tool_timeout())).get("title")
+            except CuError:
+                # The window went away between the two calls: its title is unknown, not changed.
+                return {"window": wid, "title": None, "lost": True}
+        return {"window": wid, "title": title}
+
+    def selection(self, name, base=None):
+        """Owner, TIMESTAMP and text digest; skips the slow parts once base already differs."""
+        xd, sel = self.session.xd, SELECTIONS[name]
+        state = {"owner": None, "timestamp": None, "digest": None, "length": None}
+        with SelectionConn(xd, sel) as conn:
+            state["owner"] = conn.owner() or None
+        if state["owner"] is None or (base is not None and base["owner"] != state["owner"]):
+            return state
+        with SelectionConn(xd, sel) as conn:
+            state["timestamp"] = selection_timestamp(conn, self._request_timeout())
+        if base is not None and None not in (base["timestamp"], state["timestamp"]) \
+                and base["timestamp"] != state["timestamp"]:
+            return state
+        with SelectionConn(xd, sel) as conn:
+            try:
+                _, text = read_selection(conn, timeout=self._request_timeout())
+            except CuError:
+                return state  # busy owner or no text: compare owner and timestamp only
+        state["digest"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        state["length"] = len(text)
+        return state
+
+    def frame(self):
+        return xwd_frame(run_tool(["xwd", "-root", "-silent", "-display", display_name()], binary=True,
+                                  timeout=self._tool_timeout()))
+
+
+def observe_condition(cond, probe, base=None):
+    name = cond["name"]
+    if name == "stable":
+        return probe.frame()
+    if name == "clipboard-change":
+        return probe.selection(cond["selection"], base)
+    return probe.window()
+
+
+def selection_changed(base, cur):
+    """Owner differs, or a TIMESTAMP or text both sides know differs."""
+    if base["owner"] != cur["owner"]:
+        return True
+    if cur["owner"] is None:
+        return False
+    return any(base[k] is not None and cur[k] is not None and base[k] != cur[k] for k in ("timestamp", "digest"))
+
+
+def condition_met(cond, base, cur):
+    name = cond["name"]
+    if name == "window-change":
+        return cur["window"] != base["window"]
+    if name != "clipboard-change" and cur.get("lost"):
+        return False
+    if name == "title-change":
+        return cur["title"] != base["title"]
+    if name == "window-change":
+        return cur["window"] != base["window"]
+    if name == "title-contains":
+        return cur["title"] is not None and cond["text"] in cur["title"]
+    if name == "title-matches":
+        return cur["title"] is not None and re.search(cond["text"], cur["title"]) is not None
+    if name == "clipboard-change":
+        return selection_changed(base, cur)
+    raise ValueError(name)
+
+
+def _window_hex(wid):
+    return None if wid is None else "0x%x" % wid
+
+
+def condition_report(cond, base, cur, elapsed, polls, stable_for=None):
+    name = cond["name"]
+    out = {"condition": name, "elapsed": round(elapsed, 2), "polls": polls}
+    if name in ("title-contains", "title-matches"):
+        out["text" if name == "title-contains" else "pattern"] = cond["text"]
+    if name in ("title-change", "title-contains", "title-matches", "window-change"):
+        out["title"] = cur["title"]
+        out["window"] = _window_hex(cur["window"])
+        if name == "title-change":
+            out["from"] = base["title"]
+        elif name == "window-change":
+            out["from"] = _window_hex(base["window"])
+    elif name == "clipboard-change":
+        out["selection"] = cond["selection"]
+        out["owner"] = _window_hex(cur["owner"])
+        if cur["timestamp"] is not None:
+            out["timestamp"] = cur["timestamp"]
+        if cur["length"] is not None:
+            out["length"] = cur["length"]
+    else:
+        out.update(seconds=cond["seconds"], tolerance=cond["tolerance"], stable_for=round(stable_for, 2))
+    return out
+
+
+TIMEOUT_HINTS = {
+    "stable": "the screen kept changing (animation, spinner, blinking cursor, video); raise --tolerance, "
+              "observe to see what moves, or use a fixed wait",
+    "clipboard-change": "nothing was copied, or the same app copied again without a new TIMESTAMP; "
+                        "check focus and the selection, then read it with `cu clipboard`",
+}
+CHANGE_HINT = ("the change may have happened before the wait started; use --wait-for on the action or a "
+               "batch, then observe")
+
+
+def wait_until(cond, probe, baseline=None, clock=time.monotonic, sleep=time.sleep):
+    """Poll until cond is met; returns a report or raises wait_timeout with the last value seen.
+
+    Each probe's own blocking (xprop, xwd, selection requests) is capped near the deadline.
+    """
+    if hasattr(probe, "deadline"):
+        probe.deadline = time.monotonic() + cond["timeout"]
+    try:
+        return _wait_loop(cond, probe, baseline, clock, sleep)
+    finally:
+        if hasattr(probe, "deadline"):
+            probe.deadline = None
+
+
+def _wait_loop(cond, probe, baseline, clock, sleep):
+    name = cond["name"]
+    start = clock()
+    deadline = start + cond["timeout"]
+    if name in BASELINE_CONDITIONS:
+        baseline = cond.get("from") or baseline
+        if baseline is None:
+            baseline = observe_condition(cond, probe)
+    polls, anchor, anchor_at = 0, None, None
+    while True:
+        cur = observe_condition(cond, probe, baseline)
+        polls += 1
+        now = clock()
+        if name == "stable":
+            if anchor is None or changed_pixels(anchor, cur, cond["tolerance"]) > cond["tolerance"]:
+                anchor, anchor_at = cur, now
+            met = now - anchor_at >= cond["seconds"]
+        else:
+            met = condition_met(cond, baseline, cur)
+        report = condition_report(cond, baseline, cur, now - start, polls,
+                                  None if anchor_at is None else now - anchor_at)
+        if met:
+            report["met"] = True
+            return report
+        if now >= deadline:
+            hint = TIMEOUT_HINTS.get(name, CHANGE_HINT if name in BASELINE_CONDITIONS else
+                                     "observe to see the current window title")
+            raise CuError("wait_timeout", "%s not met within %g s" % (name, cond["timeout"]), hint,
+                          met=False, **report)
+        sleep(min(WAIT_POLL_INTERVAL, deadline - now))
+
+
+# ---------------------------------------------------------------------------
 # Actions (shared by CLI and batch)
 # ---------------------------------------------------------------------------
 
@@ -1427,10 +1766,57 @@ def _v_scroll(p):
     return {"direction": direction, "amount": amount}
 
 
+def _wait_options(p, field):
+    """The condition in p[field] with its timeout and tolerance, or None when absent."""
+    if p.get(field) is None:
+        for key in ("timeout", "tolerance"):
+            if p.get(key) is not None:
+                raise usage_error("field %r needs %r" % (key, field), "conditions: " + CONDITION_SYNTAX)
+        return None
+    cond = parse_condition(p[field])
+    cond["timeout"] = float(_optional(p, "timeout", lambda v: _is_number(v) and v == v and 0 <= v <= MAX_WAIT_SECONDS,
+                                      "a number of seconds from 0 to %g" % MAX_WAIT_SECONDS, DEFAULT_WAIT_TIMEOUT))
+    if cond["name"] == "stable":
+        cond["tolerance"] = _optional(p, "tolerance", lambda v: _is_int(v) and 0 <= v <= MAX_STABLE_TOLERANCE,
+                                      "an integer number of pixels from 0 to %d" % MAX_STABLE_TOLERANCE, 0)
+        if cond["seconds"] > cond["timeout"]:
+            raise usage_error("stable period %g s is longer than the timeout %g s" % (cond["seconds"], cond["timeout"]),
+                              "raise the timeout")
+    elif p.get("tolerance") is not None:
+        raise usage_error("tolerance only applies to the stable condition")
+    return cond
+
+
 def _v_wait(p):
-    seconds = _require(p, "seconds", lambda v: _is_number(v) and v == v and 0 <= v <= MAX_WAIT_SECONDS,
-                       "a number of seconds from 0 to %g" % MAX_WAIT_SECONDS)
-    return {"seconds": float(seconds)}
+    if (p.get("seconds") is None) == (p.get("until") is None):
+        raise usage_error("wait needs either seconds or a condition",
+                          "examples: `cu wait 1`, `cu wait --title-change`; in a batch "
+                          '{"action": "wait", "seconds": 1} or {"action": "wait", "until": "title-change"}')
+    if p.get("until") is None:
+        for key in ("timeout", "tolerance", "from"):
+            if p.get(key) is not None:
+                raise usage_error("field %r only applies with 'until'" % key)
+        seconds = _require(p, "seconds", lambda v: _is_number(v) and v == v and 0 <= v <= MAX_WAIT_SECONDS,
+                           "a number of seconds from 0 to %g" % MAX_WAIT_SECONDS)
+        return {"seconds": float(seconds)}
+    cond = _wait_options(p, "until")
+    if p.get("from") is not None:
+        cond["from"] = parse_baseline(cond, p["from"])
+    return {"until": cond}
+
+
+WAIT_FIELDS = {"wait_for", "timeout", "tolerance"}
+
+
+def _with_wait_for(validator):
+    """Adds the optional wait_for/timeout/tolerance fields to an input action."""
+    def validate(p):
+        out = validator(p)
+        cond = _wait_options(p, "wait_for")
+        if cond:
+            out["wait_for"] = cond
+        return out
+    return validate
 
 
 def _v_clipboard(p):
@@ -1443,18 +1829,15 @@ VALIDATORS = {
     "info": (set(), _v_none),
     "observe": ({"path"}, _v_path),
     "screenshot": ({"path"}, _v_path),
-    "open-tab": ({"url"}, _v_open_tab),
-    "key": ({"keys"}, _v_key),
-    "type": ({"text"}, _v_type),
-    "click": ({"x", "y", "button", "count", "hover"}, _v_click),
-    "move": ({"x", "y"}, _v_point),
-    "scroll": ({"direction", "amount"}, _v_scroll),
-    "wait": ({"seconds"}, _v_wait),
+    "open-tab": ({"url"} | WAIT_FIELDS, _with_wait_for(_v_open_tab)),
+    "key": ({"keys"} | WAIT_FIELDS, _with_wait_for(_v_key)),
+    "type": ({"text"} | WAIT_FIELDS, _with_wait_for(_v_type)),
+    "click": ({"x", "y", "button", "count", "hover"} | WAIT_FIELDS, _with_wait_for(_v_click)),
+    "move": ({"x", "y"} | WAIT_FIELDS, _with_wait_for(_v_point)),
+    "scroll": ({"direction", "amount"} | WAIT_FIELDS, _with_wait_for(_v_scroll)),
+    "wait": ({"seconds", "until", "timeout", "tolerance", "from"}, _v_wait),
     "clipboard": ({"selection", "out"}, _v_clipboard),
 }
-
-NEEDS_DISPLAY = {"info", "observe", "open-tab", "key", "type", "click", "move", "scroll", "clipboard"}
-
 
 def validate_action(item):
     if not isinstance(item, dict):
@@ -1476,6 +1859,8 @@ class Session:
 
     def __init__(self):
         self._xd = None
+        self.probe = DesktopProbe(self)
+        self.captured = None
 
     @property
     def xd(self):
@@ -1502,9 +1887,28 @@ class Session:
             "active_window": active_window(xd),
         }
 
-    def run(self, p):
+    def run(self, p, capture=None, baseline=None):
+        """Run one validated action and its optional wait_for.
+
+        A "change" condition compares against a value recorded at the
+        action's commit point: when it starts or, for open-tab, just before
+        Enter (the new empty tab already changed the title). `capture` is the
+        next batch wait's condition; its value lands in self.captured.
+        `baseline` is such a value for this action's own `until`.
+        """
         action = p["action"]
         result = {"action": action}
+        own = p.get("wait_for")
+        taken = {}
+        self.captured = None
+
+        def commit():
+            for key, cond in (("capture", capture), ("own", own)):
+                if cond and cond["name"] in BASELINE_CONDITIONS and "from" not in cond:
+                    taken[key] = observe_condition(cond, self.probe)
+
+        if action != "open-tab":
+            commit()
         if action == "info":
             result.update(self.info())
         elif action == "observe":
@@ -1518,9 +1922,12 @@ class Session:
             xd.press_chord("ctrl+t")
             time.sleep(OPEN_TAB_SETTLE)
             xd.type_text(p["url"])
+            commit()
             xd.press_chord("Return")
             result["url"] = p["url"]
-            result["next"] = "run `cu wait 1` then observe; page load is not detected"
+            if not own:
+                result["next"] = ("page load is not detected; add --wait-for title-change (or run "
+                                  "`cu wait --stable`), then observe")
         elif action == "key":
             self.xd.press_chord(p["keys"])
             result["keys"] = p["keys"]
@@ -1546,6 +1953,8 @@ class Session:
         elif action == "scroll":
             self.xd.button(SCROLL_BUTTONS[p["direction"]], p["amount"], SCROLL_INTERVAL)
             result.update({"direction": p["direction"], "amount": p["amount"], "pointer": self.xd.pointer()})
+        elif action == "wait" and "until" in p:
+            result.update(wait_until(p["until"], self.probe, baseline))
         elif action == "wait":
             time.sleep(p["seconds"])
             result["seconds"] = p["seconds"]
@@ -1557,6 +1966,13 @@ class Session:
                 result["path"], result["bytes"] = write_private_text(p["out"], text)
             else:
                 result["text"] = text
+        self.captured = taken.get("capture")
+        if own:
+            try:
+                result["wait"] = wait_until(own, self.probe, taken.get("own"))
+            except CuError as exc:
+                exc.extra["action_result"] = dict(result)  # the input was sent; only the wait failed
+                raise
         return result
 
 
@@ -1584,9 +2000,13 @@ def run_batch(items, final_screenshot=None):
                 except CuError as exc:
                     return {"ok": False, "completed": 0, "results": [], "failed_index": i,
                             "error": exc.to_json()}, exc.exit_code
+        carry = None
         for i, params in enumerate(validated):
+            nxt = validated[i + 1] if i + 1 < len(validated) else None
+            capture = nxt.get("until") if nxt and nxt["action"] == "wait" else None
             try:
-                results.append(session.run(params))
+                results.append(session.run(params, capture=capture, baseline=carry))
+                carry = session.captured
             except CuError as exc:
                 return {"ok": False, "completed": len(results), "results": results,
                         "failed_index": i, "error": exc.to_json()}, exc.exit_code
@@ -1611,6 +2031,41 @@ class JsonArgumentParser(argparse.ArgumentParser):
         raise usage_error(message, "run `%s --help`" % self.prog)
 
 
+def add_wait_for(p):
+    g = p.add_argument_group("wait after the action (polls every %g s)" % WAIT_POLL_INTERVAL)
+    g.add_argument("--wait-for", metavar="CONDITION",
+                   help="record the value before acting, act, then wait: " + CONDITION_SYNTAX)
+    g.add_argument("--timeout", type=float, metavar="SECONDS",
+                   help="give up after SECONDS (default %g, max %g)" % (DEFAULT_WAIT_TIMEOUT, MAX_WAIT_SECONDS))
+    g.add_argument("--tolerance", type=int, metavar="PIXELS",
+                   help="stable only: ignore up to PIXELS changed pixels (default 0)")
+    return p
+
+
+def wait_item(args):
+    """Batch-style item for `cu wait`, turning the condition flags into an `until` spec."""
+    specs = []
+    if args.title_change:
+        specs.append("title-change")
+    if args.title_contains is not None:
+        specs.append("title-contains=" + args.title_contains)
+    if args.title_matches is not None:
+        specs.append("title-matches=" + args.title_matches)
+    if args.window_change:
+        specs.append("window-change")
+    if args.stable is not None:
+        specs.append("stable=%r" % args.stable)
+    if args.clipboard_change:
+        specs.append("clipboard-change=" + (args.selection or "clipboard"))
+    elif args.selection is not None:
+        raise usage_error("--selection only applies to --clipboard-change")
+    if len(specs) > 1:
+        raise usage_error("pick one wait condition", "run several `cu wait` commands in a row instead")
+    item = {"action": "wait", "seconds": args.seconds, "until": specs[0] if specs else None,
+            "timeout": args.timeout, "tolerance": args.tolerance, "from": args.from_}
+    return {k: v for k, v in item.items() if v is not None}
+
+
 def build_parser():
     parser = JsonArgumentParser(
         prog="cu",
@@ -1626,13 +2081,14 @@ def build_parser():
     p.add_argument("path", nargs="?", help="PNG path (default: a new file in the temp dir)")
     p = sub.add_parser("screenshot", help="capture the full desktop as PNG")
     p.add_argument("path", nargs="?", help="PNG path (default: a new file in the temp dir)")
-    p = sub.add_parser("open-tab", help="Ctrl+T in the focused browser, type URL, Enter")
+    p = add_wait_for(sub.add_parser("open-tab", help="Ctrl+T in the focused browser, type URL, Enter"))
     p.add_argument("url")
-    p = sub.add_parser("key", help="send a key chord such as ctrl+l, alt+Left, Return")
+    p = add_wait_for(sub.add_parser("key", help="send a key chord such as ctrl+l, alt+Left, Return"))
     p.add_argument("keys")
-    p = sub.add_parser("type", help="type literal text (any Unicode; characters missing from the layout use a temporary keymap entry)")
+    p = add_wait_for(sub.add_parser(
+        "type", help="type literal text (any Unicode; characters missing from the layout use a temporary keymap entry)"))
     p.add_argument("text")
-    p = sub.add_parser("click", help="click at desktop pixel X Y")
+    p = add_wait_for(sub.add_parser("click", help="click at desktop pixel X Y"))
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
     p.add_argument("--button", choices=sorted(BUTTONS), default="left")
@@ -1640,14 +2096,36 @@ def build_parser():
     p.add_argument("--hover", type=float, metavar="SECONDS",
                    help="pause over the target before pressing (default %g, max %g; 0 = click at once; "
                         "skipped when the pointer is already there)" % (DEFAULT_HOVER, MAX_HOVER_SECONDS))
-    p = sub.add_parser("move", help="move the pointer to X Y")
+    p = add_wait_for(sub.add_parser("move", help="move the pointer to X Y"))
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
-    p = sub.add_parser("scroll", help="wheel ticks at the current pointer position")
+    p = add_wait_for(sub.add_parser("scroll", help="wheel ticks at the current pointer position"))
     p.add_argument("direction", choices=sorted(SCROLL_BUTTONS))
     p.add_argument("amount", nargs="?", type=int, default=3)
-    p = sub.add_parser("wait", help="sleep for SECONDS (max %g)" % MAX_WAIT_SECONDS)
-    p.add_argument("seconds", type=float)
+    p = sub.add_parser("wait", help="sleep for SECONDS (max %g), or poll until a condition is met" % MAX_WAIT_SECONDS,
+                       description="Sleep for SECONDS, or poll every %g s until one condition is met. "
+                                   "Conditions on change compare with the value when the wait starts; "
+                                   "to catch a change your action causes, prefer `--wait-for` on the "
+                                   "action or a batch." % WAIT_POLL_INTERVAL)
+    p.add_argument("seconds", nargs="?", type=float, help="fixed sleep (instead of a condition)")
+    g = p.add_argument_group("conditions (pick one)")
+    g.add_argument("--title-change", action="store_true", help="the active window's title changes")
+    g.add_argument("--title-contains", metavar="TEXT", help="the active window's title contains TEXT")
+    g.add_argument("--title-matches", metavar="REGEX", help="the active window's title matches REGEX (re.search)")
+    g.add_argument("--window-change", action="store_true", help="another window becomes active (dialogs, new windows)")
+    g.add_argument("--stable", nargs="?", type=float, const=DEFAULT_STABLE_SECONDS, metavar="SECONDS",
+                   help="the screen stops changing for SECONDS (default %g)" % DEFAULT_STABLE_SECONDS)
+    g.add_argument("--clipboard-change", action="store_true",
+                   help="the clipboard owner, TIMESTAMP or text changes")
+    g = p.add_argument_group("condition options")
+    g.add_argument("--timeout", type=float, metavar="SECONDS",
+                   help="give up after SECONDS (default %g, max %g)" % (DEFAULT_WAIT_TIMEOUT, MAX_WAIT_SECONDS))
+    g.add_argument("--tolerance", type=int, metavar="PIXELS",
+                   help="--stable only: ignore up to PIXELS changed pixels (default 0)")
+    g.add_argument("--selection", choices=sorted(SELECTIONS), help="--clipboard-change only (default clipboard)")
+    g.add_argument("--from", dest="from_", metavar="VALUE",
+                   help="--title-change / --window-change only: compare with this title or window id "
+                        "instead of the current one")
     p = sub.add_parser("clipboard", help="print the text on the clipboard (or PRIMARY selection) as JSON")
     p.add_argument("--selection", choices=sorted(SELECTIONS), default="clipboard",
                    help="clipboard = Ctrl+C contents (default); primary = last selected text")
@@ -1696,8 +2174,11 @@ def main(argv=None):
             out, code = run_batch(items, args.screenshot)
             emit(out)
             return code
-        item = {k: v for k, v in vars(args).items() if k != "command" and v is not None}
-        item["action"] = args.command
+        if args.command == "wait":
+            item = wait_item(args)
+        else:
+            item = {k: v for k, v in vars(args).items() if k != "command" and v is not None}
+            item["action"] = args.command
         params = validate_action(item)
         session = Session()
         try:
