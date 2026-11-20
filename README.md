@@ -4,7 +4,8 @@
 
 `cu` is a small command-line tool that lets an AI agent, or a script, drive
 the current X11 desktop. It takes screenshots, reports the focused window,
-moves and clicks the mouse, types text, presses keys and scrolls.
+moves and clicks the mouse, types text, presses keys, scrolls and reads
+copied text from the clipboard.
 Every command prints one JSON object, so agents can parse the result.
 Only `--help`, `--version` and running `cu` with no command print plain
 text.
@@ -21,8 +22,9 @@ desktop:
 - **What it does:** full-desktop PNG screenshots; focused-window title,
   class, PID and geometry; display size and pointer position; pointer
   move, click (left/middle/right, single or multi) and wheel scroll; key
-  chords; literal text entry; a browser "open tab" shortcut; timed waits;
-  and JSON batches that run several of these in order.
+  chords; literal text entry; reading text from the clipboard or PRIMARY
+  selection; a browser "open tab" shortcut; timed waits; and JSON batches
+  that run several of these in order.
 - **Who it is for:** agents that decide what to do by looking at
   screenshots. Click coordinates are the same native pixels as the
   screenshot, with no scaling.
@@ -68,13 +70,24 @@ remote-desktop tool or a cross-platform input library.
 - **`open-tab` is a shortcut, not an API.** It presses Ctrl+T in whatever
   window has focus, types the URL and presses Enter. Check with `cu info`
   that a browser is focused first.
+- **Clipboard: read-only, text only.** `cu clipboard` reads text that an
+  app has already copied. It cannot set the clipboard, copy for you or read
+  images and files (`unsupported_target`). It asks for `UTF8_STRING`, then
+  `text/plain;charset=utf-8`, then `STRING`, and supports incremental (INCR)
+  transfers for large text, up to 64 MiB. It fails with `clipboard_empty`
+  when no app owns the selection and `clipboard_timeout` when the owner stays
+  silent for 3 seconds. Apps take the clipboard asynchronously, so wait
+  briefly after `cu key ctrl+c`; until they do, you read the previous
+  contents. If the app that copied has exited, the clipboard is usually
+  gone too, unless a clipboard manager keeps it.
 - **One screen, full captures.** Screenshots always cover the whole root
   window. There is no per-window or region capture, and with several
   monitors you get a single combined image.
 - **Synthetic input.** Events go through the XTEST extension. Some apps,
   games or security prompts may ignore or treat that input differently.
 - **Limits:** wait 0–60 s, scroll 1–50 ticks per call, click count 1–5,
-  click hover 0–5 s, text up to 10,000 characters per call.
+  click hover 0–5 s, text up to 10,000 characters per call, clipboard up to
+  64 MiB.
 
 ## Safety
 
@@ -85,6 +98,11 @@ can click. So:
 - Run it in a dedicated user session, VM or container when an agent
   drives it unattended.
 - Keep private windows and unrelated tabs out of reach of the agent.
+- The clipboard often holds passwords, tokens or other private text that
+  you copied earlier. `cu clipboard` hands all of it to the agent, and
+  PRIMARY holds whatever was last selected anywhere. Clear the clipboard
+  before handing over the session, and do not copy secrets while an agent
+  is running. `--out` files are created with mode 0600.
 - Prefer short batches followed by a screenshot over long blind sequences.
 - Screenshots are saved as ordinary files. Default paths go to the system
   temp directory; pass an explicit path if that directory is shared.
@@ -125,6 +143,7 @@ cu click 500 300 [--button left|middle|right] [--count N] [--hover SECONDS]
 cu move 500 300
 cu scroll down 3
 cu wait 1
+cu clipboard [--selection clipboard|primary] [--out FILE]
 cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
 ```
 
@@ -144,6 +163,36 @@ cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
   when skipped).
 - `scroll` sends wheel ticks at the current pointer position, so move over
   the target panel first.
+- `clipboard` prints `{"ok": true, "action": "clipboard", "selection":
+  "clipboard", "type": "UTF8_STRING", "length": N, "text": "..."}`, where
+  `length` counts characters. With `--out FILE` the text goes to that file
+  as UTF-8 and the JSON has `path` and `bytes` instead of `text`, which keeps
+  the output small for long pages. `--selection primary` reads the last
+  selected text instead of the last copied text.
+
+### Reading text from the screen
+
+Copying and reading the clipboard is usually faster and more accurate than
+scrolling through screenshots:
+
+```sh
+cu key ctrl+a; cu key ctrl+c; cu wait 0.3
+cu clipboard --out /tmp/page.txt
+```
+
+For the whole text of a web page in Firefox, use the devtools console
+(Ctrl+Shift+J in Chrome):
+
+```sh
+cu key ctrl+shift+k; cu wait 1
+cu type 'copy(document.body.innerText)'
+cu key Return; cu wait 0.3
+cu key F12                        # close devtools again
+cu clipboard --out /tmp/page.txt
+```
+
+Check with `cu info` first that the right window has focus, since the keys
+go wherever focus is.
 
 ### Batch
 
@@ -151,7 +200,8 @@ A batch is a JSON array (or `{"actions": [...]}`) of these actions: `info`;
 `observe`/`screenshot` with optional `path`; `open-tab` with `url`; `key`
 with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`,
 `count` and `hover` (seconds); `move` with `x`, `y`; `scroll` with `direction` and optional
-`amount`; `wait` with `seconds`.
+`amount`; `wait` with `seconds`; `clipboard` with optional `selection`
+(`clipboard` or `primary`) and `out`.
 
 ```json
 [
@@ -159,6 +209,17 @@ with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`,
   {"action": "type", "text": "example"},
   {"action": "wait", "seconds": 0.5},
   {"action": "screenshot", "path": "/tmp/result.png"}
+]
+```
+
+Copy, then read, in one call:
+
+```json
+[
+  {"action": "key", "keys": "ctrl+a"},
+  {"action": "key", "keys": "ctrl+c"},
+  {"action": "wait", "seconds": 0.3},
+  {"action": "clipboard", "out": "/tmp/page.txt"}
 ]
 ```
 
@@ -179,8 +240,10 @@ python3 -m unittest discover -s tests
 
 The unit tests need no display. They cover XWD parsing and PNG output,
 `xprop` parsing, argument and batch validation, JSON errors, and the
-release of held mouse buttons, and the Unicode typing plan and keymap
-restore logic (against an in-memory fake keymap). One test that resolves key names is
+release of held mouse buttons, the Unicode typing plan and keymap
+restore logic (against an in-memory fake keymap), and clipboard reading
+(target fallback, INCR assembly, timeouts and size limits against a
+scripted fake selection owner). One test that resolves key names is
 skipped when `$DISPLAY` is unset; it does not send input.
 
 `examples/form.html` is a local page for manual end-to-end checks. Open it
@@ -190,7 +253,11 @@ been verified on a 1920×1080 X11 desktop with Firefox. Unicode typing was
 tested in a Debian 13 VM (Xvfb, Openbox, xterm): accents, symbols, Greek,
 Cyrillic, CJK, emoji, 300 distinct CJK characters, a German layout, Caps
 Lock refusal, concurrent runs, and keymap recovery after SIGTERM and
-SIGKILL.
+SIGKILL. Clipboard reading was tested in the same VM against a scripted
+selection owner (UTF-8, STRING-only, refusing, silent, and a 1.2 MB INCR
+transfer) and against Firefox ESR: the devtools `copy(document.body.innerText)`
+recipe on a 20,000-row page (553 KB) and Ctrl+A/Ctrl+C with both CLIPBOARD
+and PRIMARY.
 
 ## AI usage disclaimer
 
