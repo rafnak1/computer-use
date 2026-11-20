@@ -726,3 +726,155 @@ class ClickHoverTests(unittest.TestCase):
         with unittest.mock.patch.object(cu.time, "sleep", side_effect=lambda s: log.append(("sleep", s))):
             hovers = [session.run(params)["hover"] for _ in range(2)]
         self.assertEqual(hovers, [cu.DEFAULT_HOVER, 0.0])
+
+
+class FakeSelection:
+    """Scripted selection owner for read_selection.
+
+    replies maps a target to None (refused), "silent", (type, bytes) or
+    ("INCR", [chunk, ...]). Chunks are delivered one per property delete.
+    """
+
+    selection = "CLIPBOARD"
+
+    def __init__(self, replies, owner=True, chunk_type="UTF8_STRING"):
+        self.replies, self.owner, self.chunk_type = replies, owner, chunk_type
+        self.events, self.prop, self.chunks, self.requested = [], None, None, []
+
+    def has_owner(self):
+        return self.owner
+
+    def convert(self, target):
+        self.requested.append(target)
+        reply = self.replies.get(target)
+        self.events.append(("property", True))  # unrelated noise before the answer
+        if reply == "silent":
+            return
+        if reply is None:
+            self.events.append(("selection", False))
+            return
+        type_name, data = reply
+        if type_name == "INCR":
+            self.prop, self.chunks = ("INCR", 32, b"\0" * 8), list(data) + [b""]
+        else:
+            self.prop = (type_name, 8, data)
+        self.events.append(("selection", True))
+
+    def next_event(self, timeout):
+        return self.events.pop(0) if self.events else None
+
+    def get_property(self, delete):
+        prop, self.prop = self.prop, None
+        self.events.append(("property", False))  # our own delete
+        if self.chunks:
+            self.prop = (self.chunk_type, 8, self.chunks.pop(0))
+            self.events.append(("property", True))
+        return prop or (None, 0, b"")
+
+
+class ClipboardTests(unittest.TestCase):
+    def read(self, conn, **kw):
+        return cu.read_selection(conn, timeout=0.01, **kw)
+
+    def error(self, conn, **kw):
+        with self.assertRaises(cu.CuError) as cm:
+            self.read(conn, **kw)
+        return cm.exception.code
+
+    def test_utf8(self):
+        conn = FakeSelection({"UTF8_STRING": ("UTF8_STRING", "héllo ✓ 😀\n".encode())})
+        self.assertEqual(self.read(conn), ("UTF8_STRING", "héllo ✓ 😀\n"))
+        self.assertEqual(conn.requested, ["UTF8_STRING"])
+
+    def test_falls_back_to_string_as_latin1(self):
+        conn = FakeSelection({"STRING": ("STRING", "café".encode("latin-1"))})
+        self.assertEqual(self.read(conn), ("STRING", "café"))
+        self.assertEqual(conn.requested, list(cu.TEXT_TARGETS))
+
+    def test_decode_uses_reported_type(self):
+        conn = FakeSelection({"UTF8_STRING": ("STRING", b"caf\xe9")})
+        self.assertEqual(self.read(conn), ("STRING", "café"))
+        self.assertEqual(cu.decode_selection_text(b"ok\0\0", "UTF8_STRING"), "ok")
+        self.assertEqual(cu.decode_selection_text(b"bad \xff", "UTF8_STRING"), "bad �")
+
+    def test_empty_text(self):
+        self.assertEqual(self.read(FakeSelection({"UTF8_STRING": ("UTF8_STRING", b"")})), ("UTF8_STRING", ""))
+
+    def test_incr_assembly(self):
+        text = "日本語 " * 5000
+        data = text.encode()
+        chunks = [data[i:i + 4097] for i in range(0, len(data), 4097)]  # splits inside characters
+        conn = FakeSelection({"UTF8_STRING": ("INCR", chunks)})
+        self.assertEqual(self.read(conn), ("UTF8_STRING", text))
+        self.assertIsNone(conn.prop)
+        self.assertEqual(conn.chunks, [])
+
+    def test_incr_with_no_chunks(self):
+        self.assertEqual(self.read(FakeSelection({"UTF8_STRING": ("INCR", [])})), ("UTF8_STRING", ""))
+
+    def test_incr_owner_stalls(self):
+        conn = FakeSelection({"UTF8_STRING": ("INCR", [b"abc", b"def"])})
+        get = conn.get_property
+
+        def stall_after_first(delete):
+            out = get(delete)
+            if out[2] == b"abc":
+                conn.events = []
+            return out
+        conn.get_property = stall_after_first
+        self.assertEqual(self.error(conn), "clipboard_timeout")
+
+    def test_errors(self):
+        self.assertEqual(self.error(FakeSelection({}, owner=False)), "clipboard_empty")
+        self.assertEqual(self.error(FakeSelection({})), "unsupported_target")
+        self.assertEqual(self.error(FakeSelection({"UTF8_STRING": "silent"})), "clipboard_timeout")
+
+    def test_size_limit(self):
+        self.assertEqual(self.error(FakeSelection({"UTF8_STRING": ("UTF8_STRING", b"x" * 11)}), limit=10),
+                         "clipboard_too_large")
+        incr = FakeSelection({"UTF8_STRING": ("INCR", [b"x" * 6, b"x" * 6])})
+        self.assertEqual(self.error(incr, limit=10), "clipboard_too_large")
+
+    def test_validation(self):
+        self.assertEqual(cu.validate_action({"action": "clipboard"}),
+                         {"action": "clipboard", "selection": "clipboard", "out": None})
+        self.assertEqual(cu.validate_action({"action": "clipboard", "selection": "primary", "out": "/x"})["out"], "/x")
+        for bad in ({"selection": "secondary"}, {"selection": 1}, {"out": ""}, {"out": 3}, {"text": "x"}):
+            with self.assertRaises(cu.CuError):
+                cu.validate_action(dict(bad, action="clipboard"))
+
+    def run_clipboard(self, argv, text="héllo"):
+        class FakeConn:
+            def __init__(self, xd, selection):
+                self.selection = selection
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        buf = io.StringIO()
+        with unittest.mock.patch.object(cu, "SelectionConn", FakeConn), \
+                unittest.mock.patch.object(cu, "read_selection", lambda conn: ("UTF8_STRING", text)), \
+                unittest.mock.patch.object(cu.Session, "xd", object()), redirect_stdout(buf):
+            code = cu.main(argv)
+        return code, json.loads(buf.getvalue())
+
+    def test_cli_prints_text(self):
+        code, out = self.run_clipboard(["clipboard"])
+        self.assertEqual(code, 0)
+        self.assertEqual((out["text"], out["length"], out["selection"]), ("héllo", 5, "clipboard"))
+
+    def test_cli_out_writes_private_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.txt")
+            code, out = self.run_clipboard(["clipboard", "--selection", "primary", "--out", path])
+            self.assertEqual(code, 0)
+            self.assertNotIn("text", out)
+            self.assertEqual((out["path"], out["length"], out["bytes"], out["selection"]), (path, 5, 6, "primary"))
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "héllo")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.listdir(d), ["c.txt"])
+            code, out = self.run_clipboard(["clipboard", "--out", os.path.join(d, "missing", "c.txt")])
+            self.assertEqual((code, out["error"]["code"]), (cu.EXIT_RUNTIME, "bad_path"))

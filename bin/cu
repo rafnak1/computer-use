@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import signal
 import stat
 import struct
@@ -37,6 +38,8 @@ SCROLL_INTERVAL = 0.03
 OPEN_TAB_SETTLE = 0.5
 KEYMAP_SETTLE = 0.05  # seconds for clients to process MappingNotify
 KEYMAP_LOCK_TIMEOUT = 30.0
+CLIPBOARD_TIMEOUT = 3.0  # seconds the selection owner may stay silent
+MAX_CLIPBOARD_BYTES = 64 * 1024 * 1024
 
 EXIT_RUNTIME = 1
 EXIT_USAGE = 2
@@ -52,6 +55,7 @@ quick start:
   cu scroll down 3                wheel ticks at the current pointer
   cu wait 1                       let a page load, then observe again
   cu open-tab https://example.com Ctrl+T, type URL, Enter (focused browser)
+  cu clipboard                    read copied text: {"text": ..., "length": N}
   cu batch actions.json           run a JSON action list ("-" = stdin)
 
 coordinates:
@@ -89,15 +93,28 @@ batch JSON (array of objects, run in order, stop on first failure):
   {"action":"move", "x":500, "y":300}
   {"action":"scroll", "direction":"down", "amount":3}
   {"action":"wait", "seconds":0.5}
+  {"action":"clipboard", "selection":"clipboard", "out":"/tmp/c.txt"}  both optional
   Options: cu batch FILE --screenshot /tmp/final.png captures the end state.
+
+reading text (instead of scroll-and-screenshot loops):
+  Select and copy, wait briefly so the app takes the clipboard, then read:
+    cu key ctrl+a; cu key ctrl+c; cu wait 0.3; cu clipboard --out /tmp/page.txt
+  Whole page text in Firefox (Chrome: ctrl+shift+j), via the devtools console
+  (F12 closes it again):
+    cu key ctrl+shift+k; cu wait 1; cu type 'copy(document.body.innerText)'
+    cu key Return; cu wait 0.3; cu key F12; cu clipboard --out /tmp/page.txt
+  Check `cu info` first so the keys go to the right window. clipboard_empty
+  means nothing is copied; an unchanged clipboard still holds the old text.
 
 limits:
   wait 0..%(wait)g s, scroll 1..%(scroll)d ticks, click count 1..%(clicks)d,
-  click hover 0..%(max_hover)g s, text up to %(text)d characters.
+  click hover 0..%(max_hover)g s, text up to %(text)d characters,
+  clipboard up to %(clip)d MiB, owner silent for at most %(clip_timeout)g s.
   No DOM, OCR or page-load detection.
 """ % {"wait": MAX_WAIT_SECONDS, "scroll": MAX_SCROLL_TICKS,
        "clicks": MAX_CLICK_COUNT, "text": MAX_TEXT_LENGTH,
-       "hover": DEFAULT_HOVER, "max_hover": MAX_HOVER_SECONDS}
+       "hover": DEFAULT_HOVER, "max_hover": MAX_HOVER_SECONDS,
+       "clip": MAX_CLIPBOARD_BYTES // (1024 * 1024), "clip_timeout": CLIPBOARD_TIMEOUT}
 
 
 class CuError(Exception):
@@ -693,6 +710,26 @@ class XDisplay:
         x.XGetGeometry.restype = ci
         x.XTranslateCoordinates.argtypes = [vp, ul, ul, ci, ci, P(ci), P(ci), P(ul)]
         x.XTranslateCoordinates.restype = ci
+        x.XInternAtom.argtypes = [vp, ctypes.c_char_p, ci]
+        x.XInternAtom.restype = ul
+        x.XGetAtomName.argtypes = [vp, ul]
+        x.XGetAtomName.restype = vp
+        x.XGetSelectionOwner.argtypes = [vp, ul]
+        x.XGetSelectionOwner.restype = ul
+        x.XConvertSelection.argtypes = [vp, ul, ul, ul, ul, ul]
+        x.XCreateSimpleWindow.argtypes = [vp, ul, ci, ci, cu, cu, cu, ul, ul]
+        x.XCreateSimpleWindow.restype = ul
+        x.XDestroyWindow.argtypes = [vp, ul]
+        x.XSelectInput.argtypes = [vp, ul, ctypes.c_long]
+        x.XConnectionNumber.argtypes = [vp]
+        x.XConnectionNumber.restype = ci
+        x.XPending.argtypes = [vp]
+        x.XPending.restype = ci
+        x.XNextEvent.argtypes = [vp, vp]
+        x.XGetWindowProperty.argtypes = [vp, ul, ul, ctypes.c_long, ctypes.c_long, ci, ul, P(ul), P(ci),
+                                         P(ul), P(ul), P(P(cb))]
+        x.XGetWindowProperty.restype = ci
+        x.XDeleteProperty.argtypes = [vp, ul, ul]
         t.XTestQueryExtension.argtypes = [vp, P(ci), P(ci), P(ci), P(ci)]
         t.XTestQueryExtension.restype = ci
         t.XTestFakeKeyEvent.argtypes = [vp, cu, ci, ul]
@@ -957,6 +994,238 @@ class XDisplay:
 
 
 # ---------------------------------------------------------------------------
+# Selections (clipboard reading)
+# ---------------------------------------------------------------------------
+
+SELECTIONS = {"clipboard": "CLIPBOARD", "primary": "PRIMARY"}
+# Text targets in order of preference; the first one the owner accepts wins.
+TEXT_TARGETS = ("UTF8_STRING", "text/plain;charset=utf-8", "STRING")
+UTF8_TYPES = ("UTF8_STRING", "text/plain;charset=utf-8")
+
+
+def decode_selection_text(data, type_name):
+    """Decode selection bytes by the property type the owner reported.
+
+    STRING is ISO Latin-1 (ICCCM); everything else is read as UTF-8, which
+    also covers ASCII-only COMPOUND_TEXT. Trailing NULs some owners append
+    are dropped.
+    """
+    data = bytes(data).rstrip(b"\0")
+    return data.decode("latin-1" if type_name == "STRING" else "utf-8", "replace")
+
+
+def _wait_event(conn, timeout, want):
+    """Next event from conn matching want(event); raises clipboard_timeout."""
+    deadline = time.monotonic() + timeout
+    while True:
+        ev = conn.next_event(max(0.0, deadline - time.monotonic()))
+        if ev is None:
+            raise CuError("clipboard_timeout",
+                          "the owner of the %s selection did not answer within %g s" % (conn.selection, timeout),
+                          "the app that copied may be busy, frozen or gone; copy again and retry")
+        if want(ev):
+            return ev
+
+
+def _check_size(total, limit):
+    if total > limit:
+        raise CuError("clipboard_too_large", "the selection holds more than %d bytes" % limit,
+                      "copy less text at a time")
+
+
+def _read_incr(conn, timeout, limit):
+    """Receive an INCR transfer: one property chunk per PropertyNotify, ended by an empty chunk."""
+    chunks, total, type_name = [], 0, None
+    while True:
+        _wait_event(conn, timeout, lambda ev: ev == ("property", True))
+        chunk_type, fmt, data = conn.get_property(delete=True)  # deleting asks for the next chunk
+        if not data:
+            return type_name, b"".join(chunks)
+        if fmt != 8:
+            raise CuError("unsupported_target", "the selection owner sent non-text INCR data (format %d)" % fmt)
+        total += len(data)
+        _check_size(total, limit)
+        chunks.append(data)
+        type_name = type_name or chunk_type
+
+
+def read_selection(conn, targets=TEXT_TARGETS, timeout=CLIPBOARD_TIMEOUT, limit=MAX_CLIPBOARD_BYTES):
+    """Fetch the selection as text through `conn` (ICCCM conversion protocol).
+
+    conn provides: selection (name), has_owner(), convert(target),
+    next_event(timeout) -> ("selection", converted) | ("property", is_new_value)
+    | None on timeout, and get_property(delete) -> (type name, format, bytes).
+    Returns (type name, text).
+    """
+    if not conn.has_owner():
+        raise CuError("clipboard_empty", "the %s selection is empty (no application owns it)" % conn.selection,
+                      "copy something first, e.g. select text and run `cu key ctrl+c`, then wait briefly")
+    for target in targets:
+        conn.convert(target)
+        _, converted = _wait_event(conn, timeout, lambda ev: ev[0] == "selection")
+        if not converted:
+            continue  # owner refused this target; try the next one
+        type_name, fmt, data = conn.get_property(delete=True)
+        if type_name == "INCR":
+            incr_type, data = _read_incr(conn, timeout, limit)
+            type_name = incr_type or target
+        elif type_name is None or fmt != 8:
+            continue
+        _check_size(len(data), limit)
+        return type_name, decode_selection_text(data, type_name)
+    raise CuError("unsupported_target", "the %s selection owner offers no text (%s)"
+                  % (conn.selection, ", ".join(targets)),
+                  "the copied content may be an image or files; copy text instead")
+
+
+class _XSelectionEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("requestor", ctypes.c_ulong), ("selection", ctypes.c_ulong),
+                ("target", ctypes.c_ulong), ("property", ctypes.c_ulong), ("time", ctypes.c_ulong)]
+
+
+class _XPropertyEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int),
+                ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("atom", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("state", ctypes.c_int)]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("type", ctypes.c_int), ("xselection", _XSelectionEvent),
+                ("xproperty", _XPropertyEvent), ("pad", ctypes.c_long * 24)]
+
+
+X_PROPERTY_NOTIFY = 28
+X_SELECTION_NOTIFY = 31
+X_PROPERTY_NEW_VALUE = 0
+X_PROPERTY_CHANGE_MASK = 1 << 22
+PROPERTY_CHUNK_LONGS = 1 << 20  # read properties 4 MiB at a time
+
+
+class SelectionConn:
+    """Requests one selection through a private unmapped window (see read_selection)."""
+
+    def __init__(self, xd, selection):
+        self.xd, self.x11, self.dpy = xd, xd.x11, xd.dpy
+        self.selection = selection
+        self._atoms = {}
+        self.sel_atom = self.atom(selection)
+        self.prop = self.atom("CU_SELECTION")
+        self.win = self.x11.XCreateSimpleWindow(self.dpy, xd.root, 0, 0, 1, 1, 0, 0, 0)
+        self.x11.XSelectInput(self.dpy, self.win, X_PROPERTY_CHANGE_MASK)
+        self.fd = self.x11.XConnectionNumber(self.dpy)
+        self._event = _XEvent()
+
+    def close(self):
+        if self.win:
+            self.x11.XDestroyWindow(self.dpy, self.win)
+            self.x11.XFlush(self.dpy)
+            self.win = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def atom(self, name):
+        if name not in self._atoms:
+            self._atoms[name] = self.x11.XInternAtom(self.dpy, name.encode(), 0)
+        return self._atoms[name]
+
+    def atom_name(self, atom):
+        for name, value in self._atoms.items():
+            if value == atom:
+                return name
+        ptr = self.x11.XGetAtomName(self.dpy, atom)
+        if not ptr:
+            return None
+        try:
+            return ctypes.string_at(ptr).decode("latin-1")
+        finally:
+            self.x11.XFree(ptr)
+
+    def has_owner(self):
+        return bool(self.x11.XGetSelectionOwner(self.dpy, self.sel_atom))
+
+    def convert(self, target):
+        self.x11.XConvertSelection(self.dpy, self.sel_atom, self.atom(target), self.prop, self.win, 0)
+        self.x11.XFlush(self.dpy)
+
+    def next_event(self, timeout):
+        deadline = time.monotonic() + timeout
+        ev = self._event
+        while True:
+            while self.x11.XPending(self.dpy):
+                self.x11.XNextEvent(self.dpy, ctypes.byref(ev))
+                if (ev.type == X_SELECTION_NOTIFY and ev.xselection.requestor == self.win
+                        and ev.xselection.selection == self.sel_atom):
+                    return ("selection", ev.xselection.property != 0)
+                if (ev.type == X_PROPERTY_NOTIFY and ev.xproperty.window == self.win
+                        and ev.xproperty.atom == self.prop):
+                    return ("property", ev.xproperty.state == X_PROPERTY_NEW_VALUE)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            select.select([self.fd], [], [], remaining)
+
+    def get_property(self, delete):
+        """(type name, format, bytes) of our property; (None, 0, b"") when unset."""
+        chunks, offset, type_name, fmt = [], 0, None, 0
+        while True:
+            atype, afmt = ctypes.c_ulong(), ctypes.c_int()
+            nitems, after = ctypes.c_ulong(), ctypes.c_ulong()
+            ptr = ctypes.POINTER(ctypes.c_ubyte)()
+            status = self.x11.XGetWindowProperty(
+                self.dpy, self.win, self.prop, offset, PROPERTY_CHUNK_LONGS, 0, 0,  # AnyPropertyType
+                ctypes.byref(atype), ctypes.byref(afmt), ctypes.byref(nitems), ctypes.byref(after),
+                ctypes.byref(ptr))
+            if status != 0:
+                raise CuError("clipboard_failed", "cannot read the converted selection property")
+            try:
+                if not atype.value:
+                    return None, 0, b""
+                fmt = afmt.value
+                unit = 1 if fmt == 8 else 2 if fmt == 16 else ctypes.sizeof(ctypes.c_long)
+                chunks.append(ctypes.string_at(ptr, nitems.value * unit) if ptr else b"")
+            finally:
+                if ptr:
+                    self.x11.XFree(ptr)
+            type_name = type_name or self.atom_name(atype.value)
+            if not after.value:
+                break
+            offset += nitems.value * fmt // 32
+            _check_size(offset * 4, MAX_CLIPBOARD_BYTES)
+        if delete:
+            self.x11.XDeleteProperty(self.dpy, self.win, self.prop)
+            self.x11.XFlush(self.dpy)
+        return type_name, fmt, b"".join(chunks)
+
+
+def write_private_text(path, text):
+    """Write text as UTF-8 to path (mode 0600, atomic); returns (abs path, bytes)."""
+    path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise CuError("bad_path", "directory does not exist: %s" % parent)
+    data = text.encode("utf-8")
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise CuError("bad_path", "cannot write %s: %s" % (path, exc.strerror or exc))
+    return path, len(data)
+
+
+# ---------------------------------------------------------------------------
 # Window metadata (xprop) and screenshots (xwd)
 # ---------------------------------------------------------------------------
 
@@ -1164,6 +1433,12 @@ def _v_wait(p):
     return {"seconds": float(seconds)}
 
 
+def _v_clipboard(p):
+    return {"selection": _optional(p, "selection", lambda v: isinstance(v, str) and v in SELECTIONS,
+                                   "one of clipboard, primary", "clipboard"),
+            "out": _optional(p, "out", _nonempty_str, "a non-empty string", None)}
+
+
 VALIDATORS = {
     "info": (set(), _v_none),
     "observe": ({"path"}, _v_path),
@@ -1175,9 +1450,10 @@ VALIDATORS = {
     "move": ({"x", "y"}, _v_point),
     "scroll": ({"direction", "amount"}, _v_scroll),
     "wait": ({"seconds"}, _v_wait),
+    "clipboard": ({"selection", "out"}, _v_clipboard),
 }
 
-NEEDS_DISPLAY = {"info", "observe", "open-tab", "key", "type", "click", "move", "scroll"}
+NEEDS_DISPLAY = {"info", "observe", "open-tab", "key", "type", "click", "move", "scroll", "clipboard"}
 
 
 def validate_action(item):
@@ -1273,6 +1549,14 @@ class Session:
         elif action == "wait":
             time.sleep(p["seconds"])
             result["seconds"] = p["seconds"]
+        elif action == "clipboard":
+            with SelectionConn(self.xd, SELECTIONS[p["selection"]]) as conn:
+                type_name, text = read_selection(conn)
+            result.update({"selection": p["selection"], "type": type_name, "length": len(text)})
+            if p["out"]:
+                result["path"], result["bytes"] = write_private_text(p["out"], text)
+            else:
+                result["text"] = text
         return result
 
 
@@ -1364,6 +1648,10 @@ def build_parser():
     p.add_argument("amount", nargs="?", type=int, default=3)
     p = sub.add_parser("wait", help="sleep for SECONDS (max %g)" % MAX_WAIT_SECONDS)
     p.add_argument("seconds", type=float)
+    p = sub.add_parser("clipboard", help="print the text on the clipboard (or PRIMARY selection) as JSON")
+    p.add_argument("--selection", choices=sorted(SELECTIONS), default="clipboard",
+                   help="clipboard = Ctrl+C contents (default); primary = last selected text")
+    p.add_argument("--out", metavar="FILE", help="write the text to FILE (UTF-8, mode 0600) instead of the JSON")
     p = sub.add_parser("batch", help="run a JSON action array from FILE or - (stdin)",
                        epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("file")
