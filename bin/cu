@@ -118,7 +118,7 @@ one process at a time (the input lock):
   It does not stop a person, other users or other tools.
 
 check the window first:
-  cu key ctrl+w --expect-class firefox --expect-title "Example"
+  cu key ctrl+w --expect-class Navigator --expect-title "Example"
   --expect-title TEXT   the active window's title contains TEXT (case-sensitive)
   --expect-class CLASS  its WM class or instance contains CLASS (any case)
   Both must hold if both are given; no active window is a mismatch. Checked
@@ -153,7 +153,7 @@ batch JSON (array of objects, run in order, stop on first failure):
   {"action":"clipboard", "selection":"clipboard", "out":"/tmp/c.txt"}  both optional
   Input actions (open-tab, key, type, click, move, scroll) also accept
   "wait_for":"title-change", "timeout":10, "tolerance":N, and
-  "expect_title":"Example", "expect_class":"firefox" (null = no check).
+  "expect_title":"Example", "expect_class":"Navigator" (null = no check).
   Options: cu batch FILE --screenshot /tmp/final.png captures the end state;
   --expect-title / --expect-class set defaults for all input actions.
 
