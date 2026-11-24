@@ -56,9 +56,9 @@ remote-desktop tool or a cross-platform input library.
   character (accents, AltGr symbols, other scripts, emoji) is typed by
   briefly binding it to an unused keycode, pressing that key, and then
   resetting the keycode, the same technique xdotool uses. This changes the
-  shared X keymap for a moment. A display-scoped lock keeps two `cu`
-  processes from clashing, and if a run is killed the next run restores
-  what it left. Keycodes that another program changed in the meantime are
+  shared X keymap for a moment. A keymap lock, separate from the
+  [input lock](#one-process-at-a-time), keeps two `cu` processes from
+  clashing, and if a run is killed the next run restores what it left. Keycodes that another program changed in the meantime are
   left alone and reported as `keymap_conflicts`. Apps re-read the keymap
   asynchronously, so `cu` waits briefly around each change; a very slow
   app could still see the wrong key. The core keymap is restored, but
@@ -71,9 +71,16 @@ remote-desktop tool or a cross-platform input library.
   distinct characters) can upset some window managers: under Openbox the
   next window stopped receiving keyboard focus. xdotool's remapping does
   the same, so prefer shorter `type` calls for large non-Latin texts.
-- **`open-tab` is a shortcut, not an API.** It presses Ctrl+T in whatever
-  window has focus, types the URL and presses Enter. Check with `cu info`
-  that a browser is focused first.
+- **`open-tab` is a shortcut, not an API.** It presses Ctrl+T in the
+  focused window, types the URL and presses Enter. It refuses with
+  `unexpected_window` unless that window is a known browser and not a
+  dialog (see [Checking the window first](#checking-the-window-first)), but
+  it cannot tell whether the tab opened.
+- **Input is exclusive only among `cu` processes** of one user on one
+  display, one command or batch at a time. **Window checks** look at the
+  active window just before the input. See
+  [One process at a time](#one-process-at-a-time) and
+  [Checking the window first](#checking-the-window-first) for what they miss.
 - **Clipboard: read-only, text only.** `cu clipboard` reads text that an
   app has already copied. It cannot set the clipboard, copy for you or read
   images and files (`unsupported_target`). It asks for `UTF8_STRING`, then
@@ -152,6 +159,7 @@ cu wait --title-change | --title-contains TEXT | --title-matches REGEX | --windo
 cu key Return --wait-for title-change       # any input action + a condition
 cu clipboard [--selection clipboard|primary] [--out FILE]
 cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
+cu key ctrl+w --expect-title TEXT --expect-class CLASS   # any input action, or batch
 ```
 
 - Failures exit nonzero (2 for invalid input, 1 for runtime errors, 130
@@ -176,6 +184,109 @@ cu batch actions.json [--screenshot /tmp/final.png]   # "-" reads stdin
   as UTF-8 and the JSON has `path` and `bytes` instead of `text`, which keeps
   the output small for long pages. `--selection primary` reads the last
   selected text instead of the last copied text.
+
+### One process at a time
+
+`key`, `type`, `click`, `move`, `scroll` and `open-tab` take an input lock
+for your user and display, so two `cu` processes cannot mix their keys and
+clicks. A single command holds it until it ends, including `--wait-for`. A
+`batch` with at least one of these actions holds it from before its first
+action through its waits and final screenshot. Arguments are checked before locking,
+and `--wait-for` baselines are recorded after it. `info`, `observe`, `screenshot`,
+`clipboard`, `wait` and batches made only of those never take it.
+
+If another process holds the lock, `cu` waits up to 5 s, then exits 1
+without sending anything:
+
+```json
+{"ok": false, "error": {"code": "busy", "message": "...", "hint": "...", "holder_pid": 4242}}
+```
+
+The lock is an `flock` on `cu-input-UID-DISPLAY.lock` in `$XDG_RUNTIME_DIR`
+(or the temp directory), so a killed process frees it. The PID in the file is only informative:
+it may be `null` or belong to an earlier holder. `input_lock` means the file
+cannot be used (not a private regular file of yours, or no such directory).
+
+What the lock does not cover:
+
+- Separate commands from two processes can still alternate. Put a sequence
+  that must not be interrupted in one `batch`.
+- A person at the keyboard, other users and tools other than `cu`.
+- `cu` versions without the lock, and processes with a different
+  `$XDG_RUNTIME_DIR`, temp directory or spelling of the display name
+  (`:0` and `:0.0` count as the same).
+
+### Checking the window first
+
+`--expect-title TEXT` and `--expect-class CLASS` make an input command fail
+instead of acting on the wrong window. The title must contain TEXT, as with
+`title-contains`. The WM class or instance must contain CLASS, ignoring
+case: snap Firefox has class `firefox_firefox` and instance `Navigator`.
+If both are given, both must match, and no active window is a mismatch. The
+check runs under the input lock, right before the first event. On a mismatch
+`cu` exits 1 and sends nothing:
+
+```sh
+cu type "hello" --expect-class Navigator --expect-title "Upload form"
+```
+
+```json
+{"ok": false, "error": {"code": "unexpected_window", "message": "...", "hint": "...",
+ "expected": {"title": "Upload form", "class": "Navigator"},
+ "active_window": {"id": "0x60001e", "title": "File Upload - Upload form — Mozilla Firefox",
+  "instance": "firefox-esr", "class": "firefox-esr", "type": ["dialog"], "transient_for": "0x600003"}}}
+```
+
+`active_window` is `null` when there is none. On `batch` the options apply
+before every input action. Items can set their own `expect_title` and
+`expect_class`, and `null` turns one check off for that item, which steps
+inside a dialog need. A mismatch stops the batch with `failed_index`:
+
+```json
+[
+  {"action": "click", "x": 47, "y": 502, "wait_for": "window-change"},
+  {"action": "wait", "seconds": 1},
+  {"action": "type", "text": "/tmp/report.pdf", "expect_class": null, "expect_title": "File Upload"},
+  {"action": "wait", "seconds": 1},
+  {"action": "key", "keys": "Return", "expect_class": null, "expect_title": "File Upload"},
+  {"action": "wait", "seconds": 1},
+  {"action": "click", "x": 285, "y": 240},
+  {"action": "type", "text": "example"}
+]
+```
+
+```sh
+cu batch upload.json --expect-class Navigator   # stops if the picker is still open
+```
+
+(The waits are for GTK's file picker, which may ignore Return right after
+the path is typed.)
+
+Choose a value that only the right window has. A browser's dialogs share
+its class, and Firefox's dialogs also repeat the page title ("File Upload -
+Upload form — Mozilla Firefox"), so neither `--expect-class firefox` nor the
+page title stops at them. In Firefox use `--expect-class Navigator`, the
+instance of its main windows only. In Chromium, whose dialogs have the
+instance of the main window, use the title. `cu info` shows all of these,
+plus `type` and `transient_for`, which mark dialogs. Titles also change
+when a page loads, so they suit single steps better than whole batches.
+
+`open-tab` always checks that the active window is a known browser (the
+Firefox and Chromium families) and not a dialog, since a browser's file
+picker has the browser's class. An explicit `--expect-class` (also as a
+batch default) replaces the browser list, so other browsers work; `null`
+goes back to the list. Dialogs, recognised by `_NET_WM_WINDOW_TYPE` or
+`WM_TRANSIENT_FOR`, are refused either way.
+
+What the checks do not cover:
+
+- They look at the active window, while a click or scroll goes to whatever
+  is under the pointer.
+- Focus can change after the check, for example during a long `type` or
+  between the Ctrl+T and the URL of `open-tab`.
+- Without an expectation, commands other than `open-tab` act on any window.
+- `open-tab` does not recognise every non-tab window of a browser, such as
+  Firefox's Library, which is neither a dialog nor of another class.
 
 ### Waiting for a condition
 
@@ -256,8 +367,8 @@ cu key F12                        # close devtools again
 cu clipboard --out /tmp/page.txt
 ```
 
-Check with `cu info` first that the right window has focus, since the keys
-go wherever focus is.
+Keys go wherever focus is, so add
+[`--expect-class` or `--expect-title`](#checking-the-window-first).
 
 ### Batch
 
@@ -268,8 +379,8 @@ with `keys`; `type` with `text`; `click` with `x`, `y`, optional `button`,
 `amount`; `wait` with `seconds`, or with `until` (a condition as above)
 and optional `timeout`, `tolerance` and `from`; `clipboard` with optional
 `selection` (`clipboard` or `primary`) and `out`. `open-tab`, `key`, `type`,
-`click`, `move` and `scroll` also take optional `wait_for`, `timeout` and
-`tolerance`.
+`click`, `move` and `scroll` also take optional `wait_for`, `timeout`,
+`tolerance`, `expect_title` and `expect_class`.
 
 In a batch, a `wait` with a "change" condition starts from the value
 recorded just before the previous action (for `open-tab`, just before
@@ -321,7 +432,8 @@ python3 -m unittest discover -s tests
 
 The unit tests need no display. They cover XWD parsing and PNG output,
 `xprop` parsing, argument and batch validation, JSON errors, and the
-release of held mouse buttons, the Unicode typing plan and keymap
+release of held mouse buttons, the input lock (with real lock files and a
+second process), window expectations, the Unicode typing plan and keymap
 restore logic (against an in-memory fake keymap), and clipboard reading
 (target fallback, INCR assembly, timeouts and size limits against a
 scripted fake selection owner), and condition waits (argument checks,
@@ -347,6 +459,13 @@ page that sets its title after 2 s, the Save As dialog with
 `--window-change` (single commands and a batch), `--stable` on a static
 and an animated page (timeout, then met with `--tolerance`), and
 `--clipboard-change` after Ctrl+C, including copying the same text again.
+The input lock and window checks were tested in a Debian 13 container (Xvfb,
+xfwm4, xfdesktop): overlapping `batch` loops in Firefox ESR (12 of 12 URLs
+intact, 1 of 12 before the lock), `busy` for every input command, read-only
+commands while the lock is held, SIGKILL of the holder, every input command
+with matching and mismatching expectations, batches stopping at an open file
+picker, and `open-tab` with Firefox ESR, Chromium, their file pickers,
+xfdesktop and xterm. Snap and Flatpak browsers were not tested.
 
 ## AI usage disclaimer
 

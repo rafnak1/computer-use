@@ -3,9 +3,13 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 import zlib
@@ -16,6 +20,26 @@ _loader = importlib.machinery.SourceFileLoader("cu", os.path.join(HERE, "..", "b
 _spec = importlib.util.spec_from_loader("cu", _loader)
 cu = importlib.util.module_from_spec(_spec)
 _loader.exec_module(cu)
+
+
+def setUpModule():
+    # Input locks go to a private directory, never to the user's real one.
+    global _runtime, _env
+    _runtime = tempfile.TemporaryDirectory()
+    _env = unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": _runtime.name})
+    _env.start()
+
+
+def tearDownModule():
+    _env.stop()
+    _runtime.cleanup()
+
+
+BROWSER = {"id": "0x1", "title": "Example — Mozilla Firefox", "class": "firefox_firefox", "instance": "Navigator",
+           "type": ["normal"]}
+DESKTOP = {"id": "0x2", "title": "Desktop", "class": "Xfdesktop", "instance": "xfdesktop", "type": ["desktop"]}
+PICKER = {"id": "0x3", "title": "File Upload - Example — Mozilla Firefox", "class": "firefox_firefox", "instance": "firefox_firefox",
+          "type": ["dialog"], "transient_for": "0x1"}
 
 
 def make_xwd(width, height, pixels, bpp=32, byte_order=0, masks=(0xFF0000, 0xFF00, 0xFF), pad=0):
@@ -116,6 +140,17 @@ class XpropTests(unittest.TestCase):
                '_NET_WM_PID(CARDINAL) = 4242\n')
         self.assertEqual(cu.parse_window_props(out),
                          {"title": 'Say "hi" — Firefox', "instance": "Navigator", "class": "firefox", "pid": 4242})
+
+    def test_window_type_and_transient_for(self):
+        out = ('_NET_WM_NAME(UTF8_STRING) = "Open File"\n'
+               'WM_CLASS(STRING) = "firefox_firefox", "firefox_firefox"\n'
+               '_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_DIALOG, _NET_WM_WINDOW_TYPE_NORMAL\n'
+               'WM_TRANSIENT_FOR(WINDOW): window id # 0x600003\n')  # no "=", as xprop prints it
+        props = cu.parse_window_props(out)
+        self.assertEqual((props["type"], props["transient_for"]), (["dialog", "normal"], "0x600003"))
+        props = cu.parse_window_props('_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NORMAL\n'
+                                      'WM_TRANSIENT_FOR:  not found.\n')
+        self.assertEqual(props, {"type": ["normal"]})
 
 
 class ValidationTests(unittest.TestCase):
@@ -1182,7 +1217,8 @@ class SessionWaitTests(unittest.TestCase):
     def test_open_tab_baseline_after_new_tab(self):
         session, log = self.session(["New Tab", "Example"])
         p = cu.validate_action({"action": "open-tab", "url": "http://x", "wait_for": "title-change"})
-        with unittest.mock.patch.object(cu.time, "sleep"):
+        with unittest.mock.patch.object(cu.time, "sleep"), \
+                unittest.mock.patch.object(cu, "active_window", lambda xd: BROWSER):
             result = session.run(p)
         self.assertEqual(log, [("key", "ctrl+t"), ("type", "http://x"), "probe", ("key", "Return"), "probe"])
         self.assertEqual(result["wait"]["from"], "New Tab")
@@ -1232,3 +1268,430 @@ class SessionWaitTests(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 self.assertEqual(cu.main(argv), cu.EXIT_USAGE, argv)
+
+
+HOLDER = """
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("cu", sys.argv[1])
+spec = importlib.util.spec_from_loader("cu", loader)
+cu = importlib.util.module_from_spec(spec)
+loader.exec_module(cu)
+with cu.InputLock():
+    print("locked", flush=True)
+    sys.stdin.readline()
+"""
+
+
+class InputDisplay:
+    """Records the input sent; everything else answers with harmless values."""
+
+    width, height = 100, 100
+
+    def __init__(self, log):
+        self.log = log
+
+    def resolve_chord(self, keys):
+        return [1]
+
+    def press_chord(self, keys):
+        self.log.append(("key", keys))
+
+    def type_text(self, text):
+        self.log.append(("type", text))
+        return {"remapped_characters": 0}
+
+    def pointer(self):
+        return {"x": 0, "y": 0}
+
+    def move(self, x, y):
+        self.log.append(("move", x, y))
+
+    def button(self, number, count=1, interval=None):
+        self.log.append(("button", number, count))
+
+
+class InputTestBase(unittest.TestCase):
+    """Runs the CLI in-process on a fake display, with real lock files in a private directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = []
+        self.window = BROWSER
+        self.patch(unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.tmp.name, "DISPLAY": ":99"}))
+        self.patch(unittest.mock.patch.object(cu, "INPUT_LOCK_TIMEOUT", 0.2))
+        self.patch(unittest.mock.patch.object(cu, "OPEN_TAB_SETTLE", 0))
+        self.patch(unittest.mock.patch.object(cu.Session, "xd", InputDisplay(self.log)))
+        self.patch(unittest.mock.patch.object(cu, "active_window", lambda xd=None: self.window))
+        for sig in (signal.SIGTERM, signal.SIGHUP):  # main() installs handlers
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+    def patch(self, patcher):
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def cli(self, *argv, stdin=None):
+        buf = io.StringIO()
+        with redirect_stdout(buf), unittest.mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            code = cu.main(list(argv))
+        return code, json.loads(buf.getvalue())
+
+    def batch(self, items, *argv):
+        return self.cli("batch", "-", *argv, stdin=json.dumps(items))
+
+    def hold(self):
+        """Another process that holds the input lock until it is released or killed."""
+        proc = subprocess.Popen([sys.executable, "-c", HOLDER, os.path.join(HERE, "..", "bin", "cu")],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+        def stop():
+            proc.kill()
+            proc.wait()
+            proc.stdin.close()
+            proc.stdout.close()
+        self.addCleanup(stop)
+        self.assertEqual(proc.stdout.readline(), "locked\n")
+        return proc
+
+
+INPUT_COMMANDS = (["key", "a"], ["type", "a"], ["click", "1", "1"], ["move", "1", "1"], ["scroll", "down"],
+                  ["open-tab", "http://x"])
+
+
+class InputLockTests(InputTestBase):
+    def test_busy_sends_nothing(self):
+        holder = self.hold()
+        for argv in INPUT_COMMANDS:
+            code, out = self.cli(*argv)
+            self.assertEqual((code, out["ok"], out["error"]["code"]), (cu.EXIT_RUNTIME, False, "busy"), argv)
+            self.assertEqual(out["error"]["holder_pid"], holder.pid)
+            self.assertIn("hint", out["error"])
+        self.assertEqual(self.log, [])
+
+    def test_busy_batch_sends_nothing(self):
+        holder = self.hold()
+        code, out = self.batch([{"action": "wait", "seconds": 0}, {"action": "type", "text": "a"}])
+        self.assertEqual((code, out["ok"], out["completed"], out["results"]), (cu.EXIT_RUNTIME, False, 0, []))
+        self.assertEqual((out["error"]["code"], out["error"]["holder_pid"]), ("busy", holder.pid))
+        self.assertEqual(self.log, [])
+
+    def test_proceeds_when_released_within_the_limit(self):
+        holder = self.hold()
+        threading.Timer(0.3, lambda: holder.stdin.write("\n") and holder.stdin.flush()).start()
+        with unittest.mock.patch.object(cu, "INPUT_LOCK_TIMEOUT", 10):
+            start = time.monotonic()
+            code, out = self.cli("key", "a")
+        self.assertEqual((code, self.log), (0, [("key", "a")]))
+        self.assertGreater(time.monotonic() - start, 0.2)
+
+    def test_killing_the_holder_frees_the_lock(self):
+        holder = self.hold()
+        self.assertEqual(self.cli("key", "a")[1]["error"]["code"], "busy")
+        holder.send_signal(signal.SIGKILL)
+        holder.wait()
+        self.assertEqual(self.cli("key", "a")[0], 0)
+        self.assertEqual(self.log, [("key", "a")])
+
+    def test_lock_is_freed_after_failure(self):
+        self.window = DESKTOP
+        self.assertEqual(self.cli("key", "a", "--expect-class", "firefox")[0], cu.EXIT_RUNTIME)
+        self.assertEqual(self.batch([{"action": "key", "keys": "a", "expect_class": "firefox"}])[0], cu.EXIT_RUNTIME)
+        self.assertEqual(self.cli("key", "a")[0], 0)
+
+    def test_read_only_commands_ignore_the_lock(self):
+        self.hold()
+        shot = {"path": "/x.png", "width": 1, "height": 1}
+        with unittest.mock.patch.object(cu.Session, "info", lambda self: {}), \
+                unittest.mock.patch.object(cu, "take_screenshot", lambda path=None: shot), \
+                unittest.mock.patch.object(cu, "SelectionConn", unittest.mock.MagicMock()), \
+                unittest.mock.patch.object(cu, "read_selection", lambda conn: ("UTF8_STRING", "t")):
+            for argv in (["info"], ["observe"], ["screenshot"], ["clipboard"], ["wait", "0"]):
+                self.assertEqual(self.cli(*argv)[0], 0, argv)
+            code, _ = self.batch([{"action": "info"}, {"action": "observe"}, {"action": "screenshot"},
+                                  {"action": "clipboard"}, {"action": "wait", "seconds": 0}],
+                                 "--screenshot", "/x.png", "--expect-class", "nothing")
+        self.assertEqual(code, 0)
+
+    def test_invalid_arguments_fail_before_the_lock(self):
+        self.hold()
+        for argv in (["scroll", "down", "0"], ["click", "500", "1"], ["move", "1", "500"],
+                     ["key", "a", "--expect-title", ""]):
+            self.assertEqual(self.cli(*argv)[0], cu.EXIT_USAGE, argv)
+
+        def unknown(self, keys):
+            raise cu.usage_error("unknown key name")
+        with unittest.mock.patch.object(InputDisplay, "resolve_chord", unknown):
+            self.assertEqual(self.cli("key", "bogus")[0], cu.EXIT_USAGE)
+            code, out = self.batch([{"action": "key", "keys": "bogus"}])
+        self.assertEqual((code, out["failed_index"]), (cu.EXIT_USAGE, 0))
+
+    def test_batch_that_types_does_not_deadlock(self):
+        rows, direct = KeymapTestBase.layout()
+        xd = FakeKeymapDisplay(rows, direct)
+        with unittest.mock.patch.object(cu.Session, "xd", xd), \
+                unittest.mock.patch.object(cu, "KEYMAP_SETTLE", 0), \
+                unittest.mock.patch.object(cu, "KEYMAP_LOCK_TIMEOUT", 0.2):
+            code, out = self.batch([{"action": "type", "text": "aé"}, {"action": "type", "text": "b"}])
+        self.assertEqual((code, out["completed"]), (0, 2))
+        self.assertEqual(len([e for e in xd.log if e[0] == "tap"]), 3)
+
+    def log_lock(self):
+        acquire, release = cu.InputLock.acquire, cu.InputLock.release
+        titles = ["A", "B"]
+
+        def logged_acquire(lock):
+            acquire(lock)
+            self.log.append("lock")
+
+        def logged_release(lock):
+            release(lock)
+            self.log.append("unlock")
+
+        def window(probe):
+            self.log.append("probe")
+            return {"window": 1, "title": titles.pop(0) if len(titles) > 1 else titles[0]}
+
+        def check(xd=None):
+            self.log.append("check")
+            return self.window
+        close = cu.Session.close
+
+        def logged_close(session):
+            close(session)
+            if "lock" in self.log:
+                self.log.append("close")
+        self.patch(unittest.mock.patch.object(cu.InputLock, "acquire", logged_acquire))
+        self.patch(unittest.mock.patch.object(cu.InputLock, "release", logged_release))
+        self.patch(unittest.mock.patch.object(cu.DesktopProbe, "window", window))
+        self.patch(unittest.mock.patch.object(cu, "active_window", check))
+        self.patch(unittest.mock.patch.object(cu.Session, "close", logged_close))
+
+    def test_baseline_and_check_come_after_locking_and_wait_before_unlocking(self):
+        self.log_lock()
+        code, out = self.cli("key", "a", "--wait-for", "title-change", "--expect-class", "firefox")
+        self.assertEqual((code, out["wait"]["from"]), (0, "A"))
+        self.assertEqual(self.log, ["lock", "probe", "check", ("key", "a"), "probe", "close", "unlock"])
+
+    def test_batch_holds_the_lock_through_waits_and_screenshot(self):
+        self.log_lock()
+
+        def shot(path=None):
+            self.log.append("screenshot")
+            return {"path": path, "width": 1, "height": 1}
+        with unittest.mock.patch.object(cu, "take_screenshot", shot):
+            code, _ = self.batch([{"action": "key", "keys": "a"}, {"action": "wait", "until": "title-change"},
+                                  {"action": "move", "x": 1, "y": 1}], "--screenshot", "/x.png")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.log, ["lock", "probe", ("key", "a"), "probe", ("move", 1, 1), "screenshot",
+                                    "close", "unlock"])
+
+    def test_preflight_connection_is_not_reused(self):
+        opened = []
+
+        class Xd(InputDisplay):
+            def __init__(self):
+                super().__init__([])
+                opened.append(self)
+
+            def close(self):
+                self.closed = True
+
+        with unittest.mock.patch.object(cu, "XDisplay", Xd), \
+                unittest.mock.patch.object(cu.Session, "xd", SESSION_XD):
+            self.assertEqual(self.cli("key", "a")[0], 0)
+            self.assertEqual(self.batch([{"action": "key", "keys": "a"}])[0], 0)
+        self.assertEqual([bool(x.log) for x in opened], [False, True, False, True])
+        self.assertTrue(all(x.closed for x in opened))
+
+    def test_batch_chords_are_checked_again_after_locking(self):
+        answers = [None, cu.CuError("key_unmapped", "gone")]  # mapped only while another process was typing
+
+        def resolve(xd, keys):
+            err = answers.pop(0)
+            if err:
+                raise err
+        with unittest.mock.patch.object(InputDisplay, "resolve_chord", resolve):
+            code, out = self.batch([{"action": "move", "x": 1, "y": 1}, {"action": "key", "keys": "é"}])
+        self.assertEqual((code, out["failed_index"], out["error"]["code"]), (cu.EXIT_RUNTIME, 1, "key_unmapped"))
+        self.assertEqual(self.log, [])
+
+    def test_lock_path(self):
+        self.assertEqual(cu.input_lock_path(), os.path.join(self.tmp.name, "cu-input-%d-_99.lock" % os.getuid()))
+        with unittest.mock.patch.dict(os.environ, {"DISPLAY": ":99.0"}):
+            self.assertEqual(cu.input_lock_path(), os.path.join(self.tmp.name, "cu-input-%d-_99.lock" % os.getuid()))
+        with unittest.mock.patch.dict(os.environ, {"DISPLAY": ":9"}):
+            self.assertNotEqual(cu.input_lock_path(), os.path.join(self.tmp.name, "cu-input-%d-_99.lock" % os.getuid()))
+
+    def test_unsafe_lock_files_are_refused(self):
+        path = cu.input_lock_path()
+        target = os.path.join(self.tmp.name, "target")
+        with open(target, "w") as fh:
+            fh.write("keep")
+        os.symlink(target, path)
+        self.assertEqual(self.cli("key", "a")[1]["error"]["code"], "input_lock")
+        os.unlink(path)
+        os.rename(target, path)
+        os.chmod(path, 0o644)
+        self.assertEqual(self.cli("key", "a")[1]["error"]["code"], "input_lock")
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "keep")
+        os.unlink(path)
+        os.mkfifo(path, 0o600)
+        self.assertEqual(self.cli("key", "a")[1]["error"]["code"], "input_lock")
+        self.assertEqual(self.log, [])
+
+    def test_missing_runtime_directory(self):
+        with unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": os.path.join(self.tmp.name, "nope")}):
+            code, out = self.cli("key", "a")
+        self.assertEqual((code, out["error"]["code"], self.log), (cu.EXIT_RUNTIME, "input_lock", []))
+
+    def test_stale_or_garbled_pid(self):
+        for content in (b"", b"garbage"):
+            holder = self.hold()
+            with open(cu.input_lock_path(), "wb") as fh:
+                fh.write(content)
+            code, out = self.cli("key", "a")
+            self.assertEqual((out["error"]["code"], out["error"]["holder_pid"]), ("busy", None))
+            holder.kill()
+            holder.wait()
+
+
+SESSION_XD = cu.Session.__dict__["xd"]  # the real property, for tests that patch XDisplay instead
+
+
+class ExpectWindowTests(InputTestBase):
+    def refused(self, code, out):
+        self.assertEqual((code, out["ok"]), (cu.EXIT_RUNTIME, False))
+        self.assertEqual(out["error"]["code"], "unexpected_window")
+        return out["error"]
+
+    def test_match(self):
+        for opts in (["--expect-title", "Mozilla"], ["--expect-class", "FIREFOX"], ["--expect-class", "navig"],
+                     ["--expect-title", "Example", "--expect-class", "firefox"]):
+            for argv in INPUT_COMMANDS:
+                self.log.clear()
+                self.assertEqual(self.cli(*argv, *opts)[0], 0, (argv, opts))
+                self.assertTrue(self.log)
+
+    def test_mismatch_sends_nothing(self):
+        for opts in (["--expect-title", "mozilla"],  # title matching is case-sensitive, like title-contains
+                     ["--expect-class", "chromium"],
+                     ["--expect-title", "Example", "--expect-class", "xterm"],
+                     ["--expect-title", "Other", "--expect-class", "firefox"]):
+            for argv in INPUT_COMMANDS:
+                err = self.refused(*self.cli(*argv, *opts))
+                self.assertEqual(err["active_window"], BROWSER)
+                self.assertEqual({k: v for k, v in err["expected"].items() if k != "browser_window"},
+                                 {o[len("--expect-"):]: v for o, v in zip(opts[::2], opts[1::2])})
+        self.assertEqual(self.log, [])
+
+    def test_no_active_window(self):
+        self.window = None
+        for opts in (["--expect-title", "a"], ["--expect-class", "a"], ["--expect-title", "a", "--expect-class", "a"]):
+            self.assertIsNone(self.refused(*self.cli("key", "a", *opts))["active_window"])
+        self.refused(*self.cli("open-tab", "http://x"))
+        self.assertEqual(self.log, [])
+
+    def test_unknown_properties_do_not_match(self):
+        self.window = {"id": "0x1", "error": "window properties unavailable"}
+        self.refused(*self.cli("key", "a", "--expect-title", "a"))
+        self.refused(*self.cli("key", "a", "--expect-class", "a"))
+        self.refused(*self.cli("open-tab", "http://x"))
+
+    def test_no_expectation_does_not_look_at_the_window(self):
+        def fail(xd=None):
+            raise AssertionError("window queried")
+        with unittest.mock.patch.object(cu, "active_window", fail):
+            self.assertEqual(self.cli("key", "a")[0], 0)
+
+    def test_batch_default_stops_the_batch(self):
+        self.window = DESKTOP
+        code, out = self.batch([{"action": "wait", "seconds": 0}, {"action": "key", "keys": "a"},
+                                {"action": "key", "keys": "b"}], "--expect-class", "firefox")
+        self.refused(code, out)
+        self.assertEqual((out["completed"], out["failed_index"], self.log), (1, 1, []))
+
+    def test_batch_default_is_checked_before_every_input_action(self):
+        windows = [BROWSER, BROWSER, PICKER]
+        with unittest.mock.patch.object(cu, "active_window", lambda xd=None: windows.pop(0)):
+            code, out = self.batch([{"action": "key", "keys": "a"}, {"action": "info"}, {"action": "key", "keys": "b"},
+                                    {"action": "key", "keys": "c"}], "--expect-class", "Navigator")
+        self.assertEqual((out.get("failed_index"), self.log), (2, [("key", "a")]), out)
+
+    def test_batch_override_and_null(self):
+        self.window = PICKER
+        items = [{"action": "key", "keys": "a", "expect_class": "firefox"},
+                 {"action": "key", "keys": "b", "expect_class": None},
+                 {"action": "key", "keys": "c"}]
+        code, out = self.batch(items, "--expect-class", "Navigator")
+        self.refused(code, out)
+        self.assertEqual((out["failed_index"], self.log), (2, [("key", "a"), ("key", "b")]))
+
+    def test_picker_with_the_browser_class_and_page_title(self):
+        self.window = PICKER  # only the instance tells Firefox's picker from its main window
+        self.assertEqual(self.cli("key", "a", "--expect-class", "firefox", "--expect-title", "Example")[0], 0)
+        self.refused(*self.cli("key", "b", "--expect-class", "Navigator"))
+        self.assertEqual(self.log, [("key", "a")])
+
+    def test_null_turns_off_only_that_check(self):
+        self.window = PICKER
+        code, out = self.batch([{"action": "key", "keys": "a", "expect_title": None}],
+                               "--expect-title", "Example", "--expect-class", "xterm")
+        self.assertEqual(self.refused(code, out)["expected"], {"class": "xterm"})
+
+    def test_invalid_expectations(self):
+        for argv in (["key", "a", "--expect-title", ""], ["key", "a", "--expect-class", ""]):
+            self.assertEqual(self.cli(*argv)[0], cu.EXIT_USAGE)
+        self.assertEqual(self.batch([{"action": "info"}], "--expect-class", "")[0], cu.EXIT_USAGE)
+        for item in ({"action": "key", "keys": "a", "expect_title": 1}, {"action": "key", "keys": "a", "expect_class": ""},
+                     {"action": "wait", "seconds": 0, "expect_title": "a"}, {"action": "info", "expect_class": None}):
+            self.assertEqual(self.batch([item])[0], cu.EXIT_USAGE, item)
+        self.assertEqual(self.log, [])
+
+    def test_open_tab_browsers(self):
+        for cls, instance in (("firefox_firefox", "Navigator"), ("firefox-esr", "Navigator"),
+                              ("org.mozilla.firefox", "Navigator"), ("Chromium", "chromium"),
+                              ("Chromium-browser", "chromium-browser"), ("Google-chrome", "google-chrome"),
+                              ("Brave-browser", "brave-browser"), ("Microsoft-edge", "microsoft-edge"),
+                              ("firefoxdeveloperedition", "Navigator"), ("Vivaldi-stable", "vivaldi-stable"),
+                              ("Google-chrome-unstable", "google-chrome-unstable")):
+            self.log.clear()
+            self.window = dict(BROWSER, **{"class": cls, "instance": instance})
+            self.assertEqual(self.cli("open-tab", "http://x")[0], 0, cls)
+            self.assertEqual(self.log, [("key", "ctrl+t"), ("type", "http://x"), ("key", "Return")])
+
+    def test_open_tab_other_windows(self):
+        for window in (DESKTOP, dict(BROWSER, **{"class": "XTerm", "instance": "xterm"}),
+                       dict(BROWSER, **{"class": "Zenity", "instance": "zenity"}),
+                       dict(BROWSER, **{"class": "chromium-bsu", "instance": "chromium-bsu"}),
+                       dict(BROWSER, **{"class": "Firefox-editor", "instance": "firefox-editor"})):
+            self.window = window
+            err = self.refused(*self.cli("open-tab", "http://x"))
+            self.assertEqual((err["active_window"], err["expected"]), (window, {"browser_window": True}))
+        self.assertEqual(self.log, [])
+
+    def test_open_tab_dialogs(self):
+        only_type = {k: v for k, v in PICKER.items() if k != "transient_for"}
+        only_transient = dict(PICKER, type=["normal"])
+        for self.window in (PICKER, only_type, only_transient):
+            self.refused(*self.cli("open-tab", "http://x"))
+            self.refused(*self.cli("open-tab", "http://x", "--expect-class", "firefox"))
+        self.assertEqual(self.log, [])
+
+    def test_open_tab_explicit_class_replaces_the_list(self):
+        self.window = dict(BROWSER, **{"class": "Nyxt", "instance": "nyxt"})
+        self.refused(*self.cli("open-tab", "http://x"))
+        self.assertEqual(self.cli("open-tab", "http://x", "--expect-class", "nyxt")[0], 0)
+        self.assertEqual(self.batch([{"action": "open-tab", "url": "http://x"}], "--expect-class", "nyxt")[0], 0)
+        self.window = BROWSER
+        self.refused(*self.cli("open-tab", "http://x", "--expect-class", "nyxt"))
+
+    def test_open_tab_null_class_keeps_the_browser_check(self):
+        item = {"action": "open-tab", "url": "http://x", "expect_class": None}
+        self.assertEqual(self.batch([item], "--expect-class", "xterm")[0], 0)
+        self.window = DESKTOP
+        self.refused(*self.batch([item], "--expect-class", "xterm"))
+
+    def test_open_tab_title_is_checked_too(self):
+        self.refused(*self.cli("open-tab", "http://x", "--expect-title", "Other"))
+        self.assertEqual(self.log, [])

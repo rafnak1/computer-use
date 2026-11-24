@@ -39,6 +39,7 @@ SCROLL_INTERVAL = 0.03
 OPEN_TAB_SETTLE = 0.5
 KEYMAP_SETTLE = 0.05  # seconds for clients to process MappingNotify
 KEYMAP_LOCK_TIMEOUT = 30.0
+INPUT_LOCK_TIMEOUT = 5.0  # seconds to wait for another cu process to finish its input
 CLIPBOARD_TIMEOUT = 3.0  # seconds the selection owner may stay silent
 MAX_CLIPBOARD_BYTES = 64 * 1024 * 1024
 DEFAULT_WAIT_TIMEOUT = 10.0
@@ -63,6 +64,7 @@ quick start:
   cu wait --stable                wait until the screen stops changing
   cu open-tab https://example.com --wait-for title-change
                                   Ctrl+T, type URL, Enter (focused browser), wait
+  cu type hi --expect-title Form  only if the active window's title contains Form
   cu clipboard                    read copied text: {"text": ..., "length": N}
   cu batch actions.json           run a JSON action list ("-" = stdin)
 
@@ -106,6 +108,33 @@ timing (wait for a condition instead of guessing sleeps):
   can keep stable from settling: --tolerance PIXELS ignores small changes.
   A title can change before the page finishes drawing; observe to check.
 
+one process at a time (the input lock):
+  key, type, click, move, scroll, open-tab and a batch that contains any of
+  them take a lock for this user and display, until they end (waits and the
+  final screenshot included). If another cu process holds it for more than %(lock)g s:
+  exit 1, code busy with holder_pid (informative), nothing sent. info,
+  observe, screenshot, clipboard and wait never take it. Separate commands
+  from two processes can still alternate: use one batch for a sequence.
+  It does not stop a person, other users or other tools.
+
+check the window first:
+  cu key ctrl+w --expect-class Navigator --expect-title "Example"
+  --expect-title TEXT   the active window's title contains TEXT (case-sensitive)
+  --expect-class CLASS  its WM class or instance contains CLASS (any case)
+  Both must hold if both are given; no active window is a mismatch. Checked
+  right before the first event. On mismatch: exit 1, unexpected_window with
+  expected and active_window, nothing sent. On `cu batch` they apply before
+  EVERY input action; an item's "expect_title"/"expect_class" overrides them
+  and null turns one off for that item (steps inside a dialog).
+  open-tab always needs a known browser (Firefox and Chromium families) that
+  is not a dialog; an explicit class replaces the browser list, while null
+  goes back to it. Dialogs such as file pickers are refused either way.
+  A browser's dialogs share its class, and Firefox's repeat the page title
+  ("File Upload - Example — Mozilla Firefox"). To stop at them, use
+  --expect-class Navigator (Firefox main windows) or the title (Chromium).
+  This checks the ACTIVE window: a click goes to whatever is under the
+  pointer, and focus can change after the check (a long type).
+
 batch JSON (array of objects, run in order, stop on first failure):
   {"action":"info"}
   {"action":"observe", "path":"/tmp/s.png"}         path optional
@@ -123,8 +152,10 @@ batch JSON (array of objects, run in order, stop on first failure):
      sets it explicitly; "tolerance":N for stable
   {"action":"clipboard", "selection":"clipboard", "out":"/tmp/c.txt"}  both optional
   Input actions (open-tab, key, type, click, move, scroll) also accept
-  "wait_for":"title-change", "timeout":10, "tolerance":N.
-  Options: cu batch FILE --screenshot /tmp/final.png captures the end state.
+  "wait_for":"title-change", "timeout":10, "tolerance":N, and
+  "expect_title":"Example", "expect_class":"Navigator" (null = no check).
+  Options: cu batch FILE --screenshot /tmp/final.png captures the end state;
+  --expect-title / --expect-class set defaults for all input actions.
 
 reading text (instead of scroll-and-screenshot loops):
   Select and copy, wait until the app takes the clipboard, then read:
@@ -135,7 +166,7 @@ reading text (instead of scroll-and-screenshot loops):
     cu key ctrl+shift+k; cu wait 1; cu type 'copy(document.body.innerText)'
     cu key Return --wait-for clipboard-change; cu key F12
     cu clipboard --out /tmp/page.txt
-  Check `cu info` first so the keys go to the right window. clipboard_empty
+  Add --expect-class so the keys go to the right window. clipboard_empty
   means nothing is copied; an unchanged clipboard still holds the old text.
 
 limits:
@@ -143,7 +174,7 @@ limits:
   click hover 0..%(max_hover)g s, text up to %(text)d characters,
   clipboard up to %(clip)d MiB, owner silent for at most %(clip_timeout)g s.
   No DOM, OCR or network-idle detection; the title is the best load signal.
-""" % {"wait": MAX_WAIT_SECONDS, "poll": WAIT_POLL_INTERVAL, "timeout": DEFAULT_WAIT_TIMEOUT,
+""" % {"wait": MAX_WAIT_SECONDS, "lock": INPUT_LOCK_TIMEOUT, "poll": WAIT_POLL_INTERVAL, "timeout": DEFAULT_WAIT_TIMEOUT,
        "stable": DEFAULT_STABLE_SECONDS, "scroll": MAX_SCROLL_TICKS,
        "clicks": MAX_CLICK_COUNT, "text": MAX_TEXT_LENGTH,
        "hover": DEFAULT_HOVER, "max_hover": MAX_HOVER_SECONDS,
@@ -329,18 +360,120 @@ def keymap_state_paths():
     return stem + ".lock", stem + ".json"
 
 
-def _check_private_file(fd, path):
+def _check_private_file(fd, path, code="keymap_lock"):
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-        raise CuError("keymap_lock", "refusing to use %s: not a private regular file owned by you" % path,
+        raise CuError(code, "refusing to use %s: not a private regular file owned by you" % path,
                       "remove it or set XDG_RUNTIME_DIR to a private directory")
+
+
+def open_lock_file(path, code):
+    """Open (creating if needed) a private lock file without following symlinks."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError as exc:
+        raise CuError(code, "cannot open lock file %s: %s" % (path, exc.strerror or exc),
+                      "set XDG_RUNTIME_DIR to a private, writable directory")
+    try:
+        _check_private_file(fd, path, code)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def acquire_flock(fd, timeout):
+    """Take an exclusive flock on fd; False if it is still held after timeout seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                raise
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.05, left))
+
+
+def input_lock_path():
+    """Lock file for this user and display; every screen of a display shares it."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    display = re.sub(r"(:\d+)\.\d+$", r"\1", display_name())
+    tag = re.sub(r"[^A-Za-z0-9.]+", "_", display)
+    return os.path.join(base, "cu-input-%d-%s.lock" % (os.getuid(), tag))
+
+
+class InputLock:
+    """Serialises cu processes that send input to this display.
+
+    A command holds it from before its wait baseline until it ends, a batch
+    for its whole run. It is always taken before the keymap lock. The file
+    holds the holder's PID for error messages only; the flock is what counts
+    and the kernel drops it when the holder dies.
+    """
+
+    def __init__(self):
+        self.fd = None
+
+    def acquire(self):
+        try:
+            path = input_lock_path()
+        except OSError as exc:
+            raise CuError("input_lock", "no directory for the input lock: %s" % (exc.strerror or exc),
+                          "set XDG_RUNTIME_DIR to a private, writable directory")
+        self.fd = open_lock_file(path, "input_lock")
+        try:
+            try:
+                locked = acquire_flock(self.fd, INPUT_LOCK_TIMEOUT)
+            except OSError as exc:
+                raise CuError("input_lock", "cannot lock %s: %s" % (path, exc.strerror or exc))
+            if not locked:
+                pid = self._holder()
+                raise CuError("busy", "another cu process%s is sending input to this display; nothing was sent"
+                              % (" (PID %d)" % pid if pid else ""),
+                              "wait for it to finish (or stop it) and retry; use `cu batch` for multi-step sequences",
+                              holder_pid=pid)
+            self._write(b"%d\n" % os.getpid())
+        except BaseException:
+            self.release()
+            raise
+
+    def release(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)  # releases the flock
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+    def _write(self, data):
+        try:
+            os.ftruncate(self.fd, 0)
+            os.pwrite(self.fd, data, 0)
+        except OSError:
+            pass  # informative only
+
+    def _holder(self):
+        """The PID in the lock file, or None; it may be stale."""
+        try:
+            return int(os.pread(self.fd, 32, 0)) or None
+        except (OSError, ValueError):
+            return None
 
 
 class ScratchKeys:
     """Temporarily bind keysyms to unused keycodes, restoring them afterwards.
 
-    A display-scoped lock serialises cooperating cu processes. A journal next
-    to it records, before every change, each row a keycode may hold, so a run
+    A display-scoped lock serialises keymap changes (input itself is already
+    serialised by InputLock, which is taken first). A journal next to it records, before every change, each row a keycode may hold, so a run
     killed mid-typing is cleaned up by the next one. Only keycodes whose
     current row is one we installed are reset; anything else is reported.
     """
@@ -378,22 +511,15 @@ class ScratchKeys:
 
     def _lock(self):
         path, self.journal = keymap_state_paths()
+        self.fd = open_lock_file(path, "keymap_lock")
         try:
-            self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except OSError as exc:
-            raise CuError("keymap_lock", "cannot open keymap lock %s: %s" % (path, exc.strerror or exc))
-        try:
-            _check_private_file(self.fd, path)
-            deadline = time.monotonic() + KEYMAP_LOCK_TIMEOUT
-            while True:
-                try:
-                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return
-                except OSError as exc:
-                    if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() > deadline:
-                        raise CuError("keymap_busy", "another cu process is typing on this display",
-                                      "retry when it finishes")
-                    time.sleep(0.05)
+            try:
+                locked = acquire_flock(self.fd, KEYMAP_LOCK_TIMEOUT)
+            except OSError as exc:
+                raise CuError("keymap_lock", "cannot lock %s: %s" % (path, exc.strerror or exc))
+            if not locked:
+                raise CuError("keymap_busy", "another cu process is typing on this display",
+                              "retry when it finishes")
         except BaseException:
             self._unlock()
             raise
@@ -1356,6 +1482,11 @@ def parse_window_props(output):
     for line in output.splitlines():
         name, _, rest = line.partition("(")
         name = name.strip()
+        if name == "WM_TRANSIENT_FOR":  # printed without "="
+            m = re.search(r"window id # (0x[0-9a-fA-F]+)", rest)
+            if m:
+                props["transient_for"] = m.group(1)
+            continue
         if "=" not in line:
             continue
         value = line.split("=", 1)[1].strip()
@@ -1372,6 +1503,10 @@ def parse_window_props(output):
             m = re.match(r"(\d+)", value)
             if m:
                 props["pid"] = int(m.group(1))
+        elif name == "_NET_WM_WINDOW_TYPE":
+            types = re.findall(r"_NET_WM_WINDOW_TYPE_(\w+)", value)
+            if types:
+                props["type"] = [t.lower() for t in types]
     return props
 
 
@@ -1383,7 +1518,8 @@ def active_window(xd=None):
     info = {"id": "0x%x" % wid}
     try:
         props = run_tool(["xprop", "-display", display_name(), "-id", "0x%x" % wid,
-                          "_NET_WM_NAME", "WM_NAME", "WM_CLASS", "_NET_WM_PID"])
+                          "_NET_WM_NAME", "WM_NAME", "WM_CLASS", "_NET_WM_PID",
+                          "_NET_WM_WINDOW_TYPE", "WM_TRANSIENT_FOR"])
         info.update(parse_window_props(props))
     except CuError:
         info["error"] = "window properties unavailable"
@@ -1392,6 +1528,28 @@ def active_window(xd=None):
         if geom:
             info["geometry"] = geom
     return info
+
+
+# WM classes (or instances) of browsers that open a new tab on Ctrl+T, with the
+# usual channel suffixes and reverse-DNS or snap prefixes (org.mozilla.firefox,
+# firefox_firefox). Whole names only: chromium-bsu is a game.
+BROWSER_CLASS = re.compile(
+    r"(?:.*[._])?(?:firefox|librewolf|waterfox|floorp|icecat|tor[ -]browser|zen"
+    r"|chromium|(?:google[- ])?chrome|brave|microsoft-edge|vivaldi|opera)"
+    r"(?:[- ]?(?:browser|esr|stable|beta|dev|unstable|nightly|aurora|snapshot|developer|edition"
+    r"|default))*", re.IGNORECASE)
+
+
+def window_classes(win):
+    return [win[k] for k in ("class", "instance") if win.get(k)]
+
+
+def title_contains(title, text):
+    return title is not None and text in title
+
+
+def is_dialog(win):
+    return "dialog" in win.get("type", ()) or "transient_for" in win
 
 
 def default_screenshot_path():
@@ -1583,7 +1741,7 @@ def condition_met(cond, base, cur):
     if name == "window-change":
         return cur["window"] != base["window"]
     if name == "title-contains":
-        return cur["title"] is not None and cond["text"] in cur["title"]
+        return title_contains(cur["title"], cond["text"])
     if name == "title-matches":
         return cur["title"] is not None and re.search(cond["text"], cur["title"]) is not None
     if name == "clipboard-change":
@@ -1805,16 +1963,28 @@ def _v_wait(p):
     return {"until": cond}
 
 
-WAIT_FIELDS = {"wait_for", "timeout", "tolerance"}
+EXPECT_FIELDS = ("expect_title", "expect_class")
+INPUT_FIELDS = {"wait_for", "timeout", "tolerance"} | set(EXPECT_FIELDS)
 
 
-def _with_wait_for(validator):
-    """Adds the optional wait_for/timeout/tolerance fields to an input action."""
+def expectations(p):
+    """The non-null expect_* fields of p, checked."""
+    out = {}
+    for field in EXPECT_FIELDS:
+        value = _optional(p, field, _nonempty_str, "a non-empty string (or null in a batch item)", None)
+        if value is not None:
+            out[field] = value
+    return out
+
+
+def _input(validator):
+    """Adds the optional fields shared by all input actions: wait_for etc. and expect_*."""
     def validate(p):
         out = validator(p)
         cond = _wait_options(p, "wait_for")
         if cond:
             out["wait_for"] = cond
+        out.update(expectations(p))
         return out
     return validate
 
@@ -1829,17 +1999,20 @@ VALIDATORS = {
     "info": (set(), _v_none),
     "observe": ({"path"}, _v_path),
     "screenshot": ({"path"}, _v_path),
-    "open-tab": ({"url"} | WAIT_FIELDS, _with_wait_for(_v_open_tab)),
-    "key": ({"keys"} | WAIT_FIELDS, _with_wait_for(_v_key)),
-    "type": ({"text"} | WAIT_FIELDS, _with_wait_for(_v_type)),
-    "click": ({"x", "y", "button", "count", "hover"} | WAIT_FIELDS, _with_wait_for(_v_click)),
-    "move": ({"x", "y"} | WAIT_FIELDS, _with_wait_for(_v_point)),
-    "scroll": ({"direction", "amount"} | WAIT_FIELDS, _with_wait_for(_v_scroll)),
+    "open-tab": ({"url"} | INPUT_FIELDS, _input(_v_open_tab)),
+    "key": ({"keys"} | INPUT_FIELDS, _input(_v_key)),
+    "type": ({"text"} | INPUT_FIELDS, _input(_v_type)),
+    "click": ({"x", "y", "button", "count", "hover"} | INPUT_FIELDS, _input(_v_click)),
+    "move": ({"x", "y"} | INPUT_FIELDS, _input(_v_point)),
+    "scroll": ({"direction", "amount"} | INPUT_FIELDS, _input(_v_scroll)),
     "wait": ({"seconds", "until", "timeout", "tolerance", "from"}, _v_wait),
     "clipboard": ({"selection", "out"}, _v_clipboard),
 }
+INPUT_ACTIONS = {"open-tab", "key", "type", "click", "move", "scroll"}
 
-def validate_action(item):
+
+def validate_action(item, defaults=None):
+    """Check one action; `defaults` are expect_* values for input actions that do not set their own."""
     if not isinstance(item, dict):
         raise usage_error("each batch item must be a JSON object")
     action = item.get("action")
@@ -1849,6 +2022,8 @@ def validate_action(item):
     unknown = sorted(set(item) - allowed - {"action"})
     if unknown:
         raise usage_error("unknown field(s) for %s: %s" % (action, ", ".join(unknown)))
+    if defaults and action in INPUT_ACTIONS:
+        item = dict(defaults, **item)  # an explicit null in the item turns the default off
     params = validator(item)
     params["action"] = action
     return params
@@ -1887,8 +2062,50 @@ class Session:
             "active_window": active_window(xd),
         }
 
+    def preflight(self, p):
+        """Checks that need the display but no input, so they can fail before the input lock."""
+        if p["action"] == "key":
+            self.xd.resolve_chord(p["keys"])
+        elif p["action"] in ("click", "move"):
+            self.check_point(p["x"], p["y"])
+
+    def check_window(self, p):
+        """Fail unless the active window is the one this input action is meant for."""
+        expected = {k[len("expect_"):]: p[k] for k in EXPECT_FIELDS if k in p}
+        open_tab = p["action"] == "open-tab"
+        if not expected and not open_tab:
+            return
+        win = active_window(self.xd)
+        have = win or {}
+        problems = []
+        if win is None:
+            problems.append("there is no active window")
+        else:
+            if "title" in expected and not title_contains(have.get("title"), expected["title"]):
+                problems.append("the title does not contain %r" % expected["title"])
+            if "class" in expected:
+                want = expected["class"].casefold()
+                if not any(want in c.casefold() for c in window_classes(have)):
+                    problems.append("neither class nor instance contains %r" % expected["class"])
+            elif open_tab and not any(BROWSER_CLASS.fullmatch(c) for c in window_classes(have)):
+                problems.append("it is not a known browser")
+            if open_tab and is_dialog(have):
+                problems.append("it is a dialog")
+        if not problems:
+            return
+        if open_tab:
+            expected["browser_window"] = True
+        hint = "observe to see which window has focus, then focus or close windows as needed"
+        if "it is not a known browser" in problems:
+            hint += "; for a browser that cu does not know, pass --expect-class (expect_class)"
+        raise CuError("unexpected_window", "unexpected active window: %s; %s did not send any input"
+                      % (" and ".join(problems), p["action"]), hint, expected=expected, active_window=win)
+
     def run(self, p, capture=None, baseline=None):
         """Run one validated action and its optional wait_for.
+
+        The caller holds the input lock for input actions, so no other cu
+        process can change the baseline or the active window here.
 
         A "change" condition compares against a value recorded at the
         action's commit point: when it starts or, for open-tab, just before
@@ -1909,6 +2126,8 @@ class Session:
 
         if action != "open-tab":
             commit()
+        if action in INPUT_ACTIONS:
+            self.check_window(p)  # last, right before the first event
         if action == "info":
             result.update(self.info())
         elif action == "observe":
@@ -1976,30 +2195,84 @@ class Session:
         return result
 
 
-def run_batch(items, final_screenshot=None):
+def run_single(params):
+    """Run one validated command, holding the input lock if it sends input."""
+    if params["action"] not in INPUT_ACTIONS:
+        session = Session()
+        try:
+            return session.run(params)
+        finally:
+            session.close()
+    session = Session()
+    try:
+        session.preflight(params)
+    finally:
+        session.close()
+    # A new connection after locking: Xlib caches the keymap, and the previous
+    # holder may have had temporary keys mapped when preflight looked.
+    with InputLock():
+        session = Session()
+        try:
+            return session.run(params)
+        finally:
+            session.close()
+
+
+def run_batch(items, final_screenshot=None, expect=None):
+    """Run a batch; `expect` holds default expect_* fields for its input actions."""
     if isinstance(items, dict) and isinstance(items.get("actions"), list):
         items = items["actions"]
     if not isinstance(items, list):
         raise usage_error("batch input must be a JSON array of action objects")
     if not items:
         raise usage_error("batch is empty")
+    defaults = expectations(expect or {})
     validated = []
     for i, item in enumerate(items):
         try:
-            validated.append(validate_action(item))
+            validated.append(validate_action(item, defaults))
         except CuError as exc:
             exc.extra["index"] = i
             raise
     session = Session()
+    try:
+        failed = check_chords(session, validated)
+        if failed:
+            return failed
+    finally:
+        session.close()  # run_validated opens a new connection, see run_single
+    if not any(params["action"] in INPUT_ACTIONS for params in validated):
+        return run_validated(validated, final_screenshot)
+    lock = InputLock()
+    try:
+        lock.acquire()
+    except CuError as exc:
+        return {"ok": False, "completed": 0, "results": [], "error": exc.to_json()}, exc.exit_code
+    try:
+        return run_validated(validated, final_screenshot)
+    finally:
+        lock.release()
+
+
+def check_chords(session, validated):
+    """The batch failure for the first key chord that does not resolve, or None."""
+    for i, params in enumerate(validated):
+        if params["action"] == "key":
+            try:
+                session.preflight(params)
+            except CuError as exc:
+                return {"ok": False, "completed": 0, "results": [], "failed_index": i,
+                        "error": exc.to_json()}, exc.exit_code
+    return None
+
+
+def run_validated(validated, final_screenshot):
+    session = Session()
     results = []
     try:
-        for i, params in enumerate(validated):
-            if params["action"] == "key":
-                try:
-                    session.xd.resolve_chord(params["keys"])
-                except CuError as exc:
-                    return {"ok": False, "completed": 0, "results": [], "failed_index": i,
-                            "error": exc.to_json()}, exc.exit_code
+        failed = check_chords(session, validated)  # again: the keymap may have changed while waiting for the lock
+        if failed:
+            return failed
         carry = None
         for i, params in enumerate(validated):
             nxt = validated[i + 1] if i + 1 < len(validated) else None
@@ -2031,7 +2304,16 @@ class JsonArgumentParser(argparse.ArgumentParser):
         raise usage_error(message, "run `%s --help`" % self.prog)
 
 
-def add_wait_for(p):
+def add_expect(p, scope=""):
+    g = p.add_argument_group("check the active window right before sending input (else unexpected_window)")
+    g.add_argument("--expect-title", metavar="TEXT",
+                   help="%sits title must contain TEXT (case-sensitive)" % scope)
+    g.add_argument("--expect-class", metavar="CLASS",
+                   help="%sits WM class or instance must contain CLASS (any case)" % scope)
+    return p
+
+
+def add_input_options(p):
     g = p.add_argument_group("wait after the action (polls every %g s)" % WAIT_POLL_INTERVAL)
     g.add_argument("--wait-for", metavar="CONDITION",
                    help="record the value before acting, act, then wait: " + CONDITION_SYNTAX)
@@ -2039,7 +2321,7 @@ def add_wait_for(p):
                    help="give up after SECONDS (default %g, max %g)" % (DEFAULT_WAIT_TIMEOUT, MAX_WAIT_SECONDS))
     g.add_argument("--tolerance", type=int, metavar="PIXELS",
                    help="stable only: ignore up to PIXELS changed pixels (default 0)")
-    return p
+    return add_expect(p)
 
 
 def wait_item(args):
@@ -2081,14 +2363,14 @@ def build_parser():
     p.add_argument("path", nargs="?", help="PNG path (default: a new file in the temp dir)")
     p = sub.add_parser("screenshot", help="capture the full desktop as PNG")
     p.add_argument("path", nargs="?", help="PNG path (default: a new file in the temp dir)")
-    p = add_wait_for(sub.add_parser("open-tab", help="Ctrl+T in the focused browser, type URL, Enter"))
+    p = add_input_options(sub.add_parser("open-tab", help="Ctrl+T in the focused browser (refused elsewhere), type URL, Enter"))
     p.add_argument("url")
-    p = add_wait_for(sub.add_parser("key", help="send a key chord such as ctrl+l, alt+Left, Return"))
+    p = add_input_options(sub.add_parser("key", help="send a key chord such as ctrl+l, alt+Left, Return"))
     p.add_argument("keys")
-    p = add_wait_for(sub.add_parser(
+    p = add_input_options(sub.add_parser(
         "type", help="type literal text (any Unicode; characters missing from the layout use a temporary keymap entry)"))
     p.add_argument("text")
-    p = add_wait_for(sub.add_parser("click", help="click at desktop pixel X Y"))
+    p = add_input_options(sub.add_parser("click", help="click at desktop pixel X Y"))
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
     p.add_argument("--button", choices=sorted(BUTTONS), default="left")
@@ -2096,10 +2378,10 @@ def build_parser():
     p.add_argument("--hover", type=float, metavar="SECONDS",
                    help="pause over the target before pressing (default %g, max %g; 0 = click at once; "
                         "skipped when the pointer is already there)" % (DEFAULT_HOVER, MAX_HOVER_SECONDS))
-    p = add_wait_for(sub.add_parser("move", help="move the pointer to X Y"))
+    p = add_input_options(sub.add_parser("move", help="move the pointer to X Y"))
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
-    p = add_wait_for(sub.add_parser("scroll", help="wheel ticks at the current pointer position"))
+    p = add_input_options(sub.add_parser("scroll", help="wheel ticks at the current pointer position"))
     p.add_argument("direction", choices=sorted(SCROLL_BUTTONS))
     p.add_argument("amount", nargs="?", type=int, default=3)
     p = sub.add_parser("wait", help="sleep for SECONDS (max %g), or poll until a condition is met" % MAX_WAIT_SECONDS,
@@ -2134,6 +2416,7 @@ def build_parser():
                        epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("file")
     p.add_argument("--screenshot", metavar="PATH", help="capture the final state after the batch")
+    add_expect(p, "before every input action that does not set its own: ")
     return parser
 
 
@@ -2171,7 +2454,8 @@ def main(argv=None):
                 items = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise usage_error("batch input is not valid JSON: %s" % exc)
-            out, code = run_batch(items, args.screenshot)
+            expect = {k: getattr(args, k) for k in EXPECT_FIELDS if getattr(args, k) is not None}
+            out, code = run_batch(items, args.screenshot, expect)
             emit(out)
             return code
         if args.command == "wait":
@@ -2180,11 +2464,7 @@ def main(argv=None):
             item = {k: v for k, v in vars(args).items() if k != "command" and v is not None}
             item["action"] = args.command
         params = validate_action(item)
-        session = Session()
-        try:
-            result = session.run(params)
-        finally:
-            session.close()
+        result = run_single(params)
         result["ok"] = True
         emit(dict([("ok", True)] + [(k, v) for k, v in result.items() if k != "ok"]))
         return 0
