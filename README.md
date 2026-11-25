@@ -12,8 +12,8 @@ Only `--help`, `--version` and running `cu` with no command print plain
 text.
 
 It is one Python 3 file with no pip dependencies. Input goes through
-libX11/libXtst via `ctypes`, screenshots come from `xwd` and are encoded to
-PNG in-process, and window metadata comes from `xprop`.
+libX11/libXtst via `ctypes`, screenshots are read from the root window with
+libX11 and encoded to PNG in-process, and window metadata comes from `xprop`.
 
 ## Scope
 
@@ -94,6 +94,13 @@ remote-desktop tool or a cross-platform input library.
 - **One screen, full captures.** Screenshots always cover the whole root
   window. There is no per-window or region capture, and with several
   monitors you get a single combined image.
+- **Screenshots show what the X server has drawn.** If `cu info` and the
+  screenshot disagree about which window is open, trust `cu info`: keys
+  go to the active window, drawn or not. A compositor that fails to draw a
+  window leaves it out of screenshots, of `--stable` and of your own view
+  (seen with xfwm4's `vblank_mode` auto under TigerVNC; `off` fixed it).
+  Displays whose root window is not TrueColor use `xwd -root`, which can miss
+  a window that lies inside another one.
 - **Synthetic input.** Events go through the XTEST extension. Some apps,
   games or security prompts may ignore or treat that input differently.
 - **Limits:** wait and wait timeouts 0–60 s, scroll 1–50 ticks per call, click count 1–5,
@@ -122,7 +129,9 @@ can click. So:
 
 - Python 3 (developed on 3.14; CI runs 3.9 and 3.13)
 - libX11 and libXtst, and an X server with the XTEST extension
-- `xwd` and `xprop`
+- `xprop`
+- `xwd`, only for displays whose root window is not TrueColor (8-bit
+  indexed colour, for example)
 
 On Debian/Ubuntu these come from `libx11-6 libxtst6 x11-apps x11-utils`.
 
@@ -336,7 +345,7 @@ the wait times out, the error carries the action's result as
 Notes:
 
 - The title and window come from `xprop`, which runs twice per poll.
-- `--stable` compares raw `xwd` captures without encoding PNGs. Spinners,
+- `--stable` compares raw screen captures without encoding PNGs. Spinners,
   video, animations and blinking text cursors stop the screen from
   settling; `--tolerance PIXELS` ignores up to that many changed pixels
   (compared with the first frame of the quiet period, so slow drift still
@@ -440,7 +449,8 @@ scripted fake selection owner), and condition waits (argument checks,
 baselines before the action and in batches, timeouts, and the title,
 window, frame and clipboard comparisons against fake sources and a fake
 clock). One test that resolves key names is
-skipped when `$DISPLAY` is unset; it does not send input.
+skipped when `$DISPLAY` is unset; it does not send input. The screen capture
+tests start a private Xvfb and are skipped if it is not installed.
 
 `examples/form.html` is a local page for manual end-to-end checks. Open it
 in a browser, then use `cu` to fill in the fields, tick the checkbox with
