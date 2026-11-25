@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """cu: a small X11 computer-use CLI (stdlib only).
 
-Requires Python 3, libX11, libXtst, xwd and xprop. Every command prints one
-JSON object on stdout; failures exit nonzero with {"ok": false, "error": ...}.
+Requires Python 3, libX11, libXtst and xprop (and xwd on displays whose root
+window is not TrueColor). Every command prints one JSON object on stdout; failures exit nonzero with {"ok": false, "error": ...}.
 """
 
 import argparse
@@ -76,6 +76,8 @@ viewing screenshots:
   The CLI only writes PNG files. Open the returned path with your image
   viewer tool and look at it before deciding the next action. An exit code
   of 0 means the input was sent, not that the application reacted.
+  If `cu info` and the screenshot disagree about which window is open, trust
+  `cu info`: keys go to the active window, drawn or not.
 
 keys:
   Chords join names with "+": ctrl+l, ctrl+shift+Tab, alt+Left, Return,
@@ -688,7 +690,7 @@ def _mask_shift(mask):
 def _xwd_header(data):
     """Validated XWD (version 7, ZPixmap) header fields plus pixel offsets."""
     if len(data) < 100:
-        raise CuError("screenshot_failed", "xwd output is truncated")
+        raise CuError("screenshot_failed", "screen capture is truncated")
     fields = struct.unpack(">25I", data[:100])
     (header_size, version, fmt, depth, width, height, _xoff, byte_order,
      _bunit, _bbo, _bpad, bpp, bpl, vclass, rmask, gmask, bmask, _bits_rgb,
@@ -705,7 +707,7 @@ def _xwd_header(data):
     pix_off = cmap_off + ncolors * 12
     need = pix_off + bpl * height
     if len(data) < need:
-        raise CuError("screenshot_failed", "xwd output is truncated (%d < %d bytes)" % (len(data), need))
+        raise CuError("screenshot_failed", "screen capture is truncated (%d < %d bytes)" % (len(data), need))
     return (width, height, byte_order, bpp, bpl, vclass, rmask, gmask, bmask,
             cmap_off, ncolors, pix_off, need)
 
@@ -818,6 +820,19 @@ def display_hint():
 
 
 _X_ERROR_HANDLER_TYPE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class _Visual(ctypes.Structure):
+    _fields_ = [("ext_data", ctypes.c_void_p), ("visualid", ctypes.c_ulong), ("visual_class", ctypes.c_int),
+                ("red_mask", ctypes.c_ulong), ("green_mask", ctypes.c_ulong), ("blue_mask", ctypes.c_ulong),
+                ("bits_per_rgb", ctypes.c_int), ("map_entries", ctypes.c_int)]
+
+
+class _XImage(ctypes.Structure):  # only the fields before the private ones
+    _fields_ = [("width", ctypes.c_int), ("height", ctypes.c_int), ("xoffset", ctypes.c_int),
+                ("format", ctypes.c_int), ("data", ctypes.c_void_p), ("byte_order", ctypes.c_int),
+                ("bitmap_unit", ctypes.c_int), ("bitmap_bit_order", ctypes.c_int), ("bitmap_pad", ctypes.c_int),
+                ("depth", ctypes.c_int), ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int)]
 
 
 class _XModifierKeymap(ctypes.Structure):
@@ -1442,19 +1457,20 @@ def write_private_text(path, text):
 
 
 # ---------------------------------------------------------------------------
-# Window metadata (xprop) and screenshots (xwd)
+# Window metadata (xprop) and screenshots (XGetImage on the root window)
 # ---------------------------------------------------------------------------
 
-def run_tool(argv, binary=False, timeout=20):
+def run_tool(argv, binary=False, timeout=20, name=None):
+    name = name or argv[0]
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout)
     except FileNotFoundError:
-        raise CuError("tool_missing", "%s is not installed" % argv[0], "install the %s package" % argv[0])
+        raise CuError("tool_missing", "%s is not installed" % name, "install the %s package" % name)
     except subprocess.TimeoutExpired:
-        raise CuError("tool_timeout", "%s timed out" % argv[0], display_hint())
+        raise CuError("tool_timeout", "%s timed out" % name, display_hint())
     if proc.returncode != 0:
         msg = proc.stderr.decode("utf-8", "replace").strip() or "exit status %d" % proc.returncode
-        raise CuError("tool_failed", "%s failed: %s" % (argv[0], msg), display_hint())
+        raise CuError("tool_failed", "%s failed: %s" % (name, msg), display_hint())
     return proc.stdout if binary else proc.stdout.decode("utf-8", "replace")
 
 
@@ -1562,13 +1578,90 @@ def default_screenshot_path():
     return path
 
 
+TRUE_COLOR = 4
+Z_PIXMAP = 2
+CAPTURE_COMMAND = "__capture-root"  # internal: this script run as capture_root's helper process
+
+
+def xwd_bytes(image, pixels, visual):
+    """An XWD dump of a TrueColor ZPixmap, as xwd_to_rgb and xwd_frame read it."""
+    name = b"root\0"
+    return struct.pack(
+        ">25I", 100 + len(name), 7, Z_PIXMAP, image.depth, image.width, image.height, image.xoffset,
+        image.byte_order, image.bitmap_unit, image.bitmap_bit_order, image.bitmap_pad, image.bits_per_pixel,
+        image.bytes_per_line, visual.visual_class, visual.red_mask, visual.green_mask, visual.blue_mask,
+        visual.bits_per_rgb, visual.map_entries, 0, image.width, image.height, 0, 0, 0) + name + pixels
+
+
+def capture_main():
+    """Helper process of capture_root: write the root window to stdout as XWD.
+
+    Writes nothing if the root is not TrueColor. X errors end the process
+    through Xlib's default handlers, with the reason on stderr.
+    """
+    x = XDisplay._load("X11", "libX11.so.6")
+    vp, ul, ci, cu = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+    P = ctypes.POINTER
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XOpenDisplay.restype = vp
+    x.XDefaultScreen.argtypes = [vp]
+    x.XRootWindow.argtypes = [vp, ci]
+    x.XRootWindow.restype = ul
+    x.XDefaultVisual.argtypes = [vp, ci]
+    x.XDefaultVisual.restype = P(_Visual)
+    x.XGetGeometry.argtypes = [vp, ul, P(ul), P(ci), P(ci), P(cu), P(cu), P(cu), P(cu)]
+    x.XGetImage.argtypes = [vp, ul, ci, ci, cu, cu, ul, ci]
+    x.XGetImage.restype = P(_XImage)
+    dpy = x.XOpenDisplay(display_name().encode())
+    if not dpy:
+        sys.exit("cannot open X display %s" % display_name())
+    screen = x.XDefaultScreen(dpy)
+    root = x.XRootWindow(dpy, screen)
+    visual = x.XDefaultVisual(dpy, screen).contents
+    masks = visual.red_mask | visual.green_mask | visual.blue_mask
+    if visual.visual_class != TRUE_COLOR or not masks:
+        return 0
+    root_return, left, top = ul(), ci(), ci()
+    width, height, border, depth = cu(), cu(), cu(), cu()
+    x.XGetGeometry(dpy, root, *[ctypes.byref(v) for v in (root_return, left, top, width, height, border, depth)])
+    # Only the colour bits: the unused ones would look like changes to `stable`.
+    image = x.XGetImage(dpy, root, 0, 0, width, height, masks, Z_PIXMAP)
+    if not image:
+        sys.exit("cannot read the root window")
+    image = image.contents
+    pixels = ctypes.string_at(image.data, image.bytes_per_line * image.height)
+    sys.stdout.buffer.write(xwd_bytes(image, pixels, visual))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def capture_root(timeout=20):
+    """The screen as the X server shows it, as XWD data.
+
+    Not `xwd -root`: when windows use several visuals, xwd puts the image
+    together from single windows and skips one that lies inside another
+    window with the same visual, taking its pixels to be in the outer one.
+    Redirected windows (by a compositor, or by the server when their depth
+    is not the root's) have pixels of their own, so dialogs went missing.
+
+    A helper process does it because Xlib calls cannot be timed out and end
+    the process when the connection is lost.
+    """
+    deadline = time.monotonic() + timeout
+    data = run_tool([sys.executable, os.path.abspath(__file__), CAPTURE_COMMAND], binary=True, timeout=timeout,
+                    name="screen capture")
+    if data:
+        return data
+    return run_tool(["xwd", "-root", "-silent", "-display", display_name()], binary=True,
+                    timeout=max(0.05, deadline - time.monotonic()))
+
+
 def take_screenshot(path=None):
     path = os.path.abspath(os.path.expanduser(path or default_screenshot_path()))
     parent = os.path.dirname(path)
     if not os.path.isdir(parent):
         raise CuError("bad_path", "directory does not exist: %s" % parent)
-    data = run_tool(["xwd", "-root", "-silent", "-display", display_name()], binary=True)
-    width, height, rows = xwd_to_rgb(data)
+    width, height, rows = xwd_to_rgb(capture_root())
     png = png_bytes(width, height, rows)
     tmp = "%s.tmp-%d" % (path, os.getpid())
     try:
@@ -1708,8 +1801,7 @@ class DesktopProbe:
         return state
 
     def frame(self):
-        return xwd_frame(run_tool(["xwd", "-root", "-silent", "-display", display_name()], binary=True,
-                                  timeout=self._tool_timeout()))
+        return xwd_frame(capture_root(self._tool_timeout()))
 
 
 def observe_condition(cond, probe, base=None):
@@ -1790,7 +1882,7 @@ CHANGE_HINT = ("the change may have happened before the wait started; use --wait
 def wait_until(cond, probe, baseline=None, clock=time.monotonic, sleep=time.sleep):
     """Poll until cond is met; returns a report or raises wait_timeout with the last value seen.
 
-    Each probe's own blocking (xprop, xwd, selection requests) is capped near the deadline.
+    Each probe's own blocking (xprop, screen capture, selection requests) is capped near the deadline.
     """
     if hasattr(probe, "deadline"):
         probe.deadline = time.monotonic() + cond["timeout"]
@@ -2477,4 +2569,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == [CAPTURE_COMMAND]:
+        sys.exit(capture_main())
     sys.exit(main())

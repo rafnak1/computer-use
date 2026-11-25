@@ -1,8 +1,11 @@
+import ctypes
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -1695,3 +1698,188 @@ class ExpectWindowTests(InputTestBase):
     def test_open_tab_title_is_checked_too(self):
         self.refused(*self.cli("open-tab", "http://x", "--expect-title", "Other"))
         self.assertEqual(self.log, [])
+
+
+class XvfbDisplay:
+    """A private Xvfb with a few solid-colour windows of a chosen depth."""
+
+    def __init__(self, *args):
+        r, w = os.pipe()
+        self.proc = subprocess.Popen(["Xvfb", "-displayfd", str(w), "-nolisten", "tcp", "-noreset"] + list(args),
+                                     pass_fds=(w,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.close(w)
+        with os.fdopen(r) as fh:
+            ready = select.select([fh], [], [], 20)[0]
+            number = fh.readline().strip() if ready else ""
+        if not number:
+            self.stop()
+            raise RuntimeError("Xvfb did not start")
+        self.name = ":" + number
+        self.x = x = cu.XDisplay._load("X11", "libX11.so.6")
+        vp, ul, ci, cuint = ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XOpenDisplay.restype = vp
+        x.XCloseDisplay.argtypes = [vp]
+        x.XDefaultRootWindow.argtypes = [vp]
+        x.XDefaultRootWindow.restype = ul
+        x.XMatchVisualInfo.argtypes = [vp, ci, ci, ci, vp]
+        x.XCreateColormap.argtypes = [vp, ul, vp, ci]
+        x.XCreateColormap.restype = ul
+        x.XCreateWindow.argtypes = [vp, ul, ci, ci, cuint, cuint, cuint, ci, cuint, vp, ul, vp]
+        x.XCreateWindow.restype = ul
+        x.XMapRaised.argtypes = [vp, ul]
+        x.XSetWindowBackground.argtypes = [vp, ul, ul]
+        x.XClearWindow.argtypes = [vp, ul]
+        x.XSync.argtypes = [vp, ci]
+        self.dpy = x.XOpenDisplay(self.name.encode())
+        self.root = x.XDefaultRootWindow(self.dpy)
+
+    def stop(self):
+        if getattr(self, "dpy", None):
+            self.x.XCloseDisplay(self.dpy)
+        self.proc.terminate()  # lets it remove its socket and lock file
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+
+    def argb(self):
+        """(visual, colormap) of depth 32, shared by the windows as toolkits do."""
+        class Info(ctypes.Structure):  # XVisualInfo
+            _fields_ = [("visual", ctypes.c_void_p), ("rest", ctypes.c_ulong * 16)]
+        info = Info()
+        if not self.x.XMatchVisualInfo(self.dpy, 0, 32, 4, ctypes.byref(info)):
+            raise unittest.SkipTest("no depth 32 visual")
+        return info.visual, self.x.XCreateColormap(self.dpy, self.root, info.visual, 0)
+
+    def window(self, argb, x, y, w, h, color):
+        class Attributes(ctypes.Structure):  # XSetWindowAttributes
+            _fields_ = [("background_pixmap", ctypes.c_ulong), ("background_pixel", ctypes.c_ulong),
+                        ("border_pixmap", ctypes.c_ulong), ("border_pixel", ctypes.c_ulong),
+                        ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int),
+                        ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+                        ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int),
+                        ("event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+                        ("override_redirect", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                        ("cursor", ctypes.c_ulong)]
+        attrs = Attributes(background_pixel=color, colormap=argb[1])
+        mask = 0x2 | 0x8 | 0x2000  # background pixel, border pixel, colormap
+        win = self.x.XCreateWindow(self.dpy, self.root, x, y, w, h, 0, 32, 1, argb[0], mask, ctypes.byref(attrs))
+        self.x.XMapRaised(self.dpy, win)
+        self.x.XSync(self.dpy, 0)
+        return win
+
+    def paint(self, win, color):
+        self.x.XSetWindowBackground(self.dpy, win, color)
+        self.x.XClearWindow(self.dpy, win)
+        self.x.XSync(self.dpy, 0)
+
+
+@unittest.skipUnless(shutil.which("Xvfb"), "needs Xvfb")
+class ScreenCaptureTest(unittest.TestCase):
+    """Windows of depth 32 on a depth 24 root, one inside the other: `xwd -root` skips the inner one."""
+
+    def start(self, *args):
+        display = XvfbDisplay(*args)
+        self.addCleanup(display.stop)
+        env = unittest.mock.patch.dict(os.environ, {"DISPLAY": display.name})
+        env.start()
+        self.addCleanup(env.stop)
+        return display
+
+    def dialog(self):
+        display = self.start("-screen", "0", "300x200x24")
+        argb = display.argb()
+        display.window(argb, 10, 10, 200, 150, 0xFF0000FF)
+        return display, display.window(argb, 50, 40, 60, 50, 0xFF00FF00)
+
+    def test_window_inside_another_is_captured(self):
+        self.dialog()
+        width, height, rows = cu.xwd_to_rgb(cu.capture_root())
+        self.assertEqual((width, height), (300, 200))
+        at = lambda x, y: tuple(rows[y][x * 3:x * 3 + 3])
+        self.assertEqual(at(20, 20), (0, 0, 255))
+        self.assertEqual(at(60, 50), (0, 255, 0))
+        self.assertEqual(at(109, 89), (0, 255, 0))
+        self.assertEqual(at(110, 90), (0, 0, 255))
+
+    def test_window_past_the_edge(self):
+        display, _ = self.dialog()
+        display.window(display.argb(), 280, 190, 100, 100, 0xFFFF0000)
+        _, _, rows = cu.xwd_to_rgb(cu.capture_root())
+        self.assertEqual(tuple(rows[199][-3:]), (255, 0, 0))
+
+    def test_screenshot_command(self):
+        self.dialog()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.png")
+            out = subprocess.run([sys.executable, cu.__file__, "screenshot", path], capture_output=True)
+            self.assertEqual(json.loads(out.stdout)["screenshot"], {"path": path, "width": 300, "height": 200})
+            with open(path, "rb") as fh:
+                _, _, rows = decode_png(fh.read())
+        self.assertEqual(rows[50][60], (0, 255, 0))
+
+    def test_stable_sees_the_inner_window(self):
+        display, win = self.dialog()
+        probe = cu.DesktopProbe(None)
+        a, b = probe.frame(), probe.frame()
+        self.assertEqual(cu.changed_pixels(a, b, 0), 0)
+        display.paint(win, 0xFFFFFF00)
+        self.assertEqual(cu.changed_pixels(a, probe.frame(), 10 ** 6), 60 * 50)
+
+    def test_indexed_root_falls_back_to_xwd(self):
+        self.start("-screen", "0", "64x48x8")
+        calls = []
+        run = cu.run_tool
+
+        def logged(argv, **kw):
+            calls.append(argv[0])
+            if argv[0] == "xwd":
+                return b"dump"  # xwd may not be installed
+            return run(argv, **kw)
+        with unittest.mock.patch.object(cu, "run_tool", logged):
+            self.assertEqual(cu.capture_root(), b"dump")
+        self.assertEqual(calls, [sys.executable, "xwd"])
+
+    def test_hung_server_times_out(self):
+        display = self.start("-screen", "0", "64x48x24")
+        display.proc.send_signal(signal.SIGSTOP)
+        try:
+            with self.assertRaises(cu.CuError) as cm:
+                cu.capture_root(timeout=0.7)
+        finally:
+            display.proc.send_signal(signal.SIGCONT)
+        self.assertEqual(cm.exception.code, "tool_timeout")
+        self.assertIn("screen capture", cm.exception.message)
+
+
+class CaptureRootTest(unittest.TestCase):
+    def test_no_display(self):
+        with unittest.mock.patch.dict(os.environ, {"DISPLAY": ":65000"}), \
+                self.assertRaises(cu.CuError) as cm:
+            cu.capture_root()
+        self.assertEqual(cm.exception.code, "tool_failed")
+        self.assertIn("cannot open X display :65000", cm.exception.message)
+
+    def test_fallback_gets_the_remaining_time(self):
+        seen = []
+
+        def fake(argv, binary=False, timeout=20, name=None):
+            seen.append((argv[0], timeout))
+            time.sleep(0.05)
+            return b"" if argv[0] == sys.executable else b"dump"
+        with unittest.mock.patch.object(cu, "run_tool", fake):
+            self.assertEqual(cu.capture_root(timeout=5), b"dump")
+        self.assertEqual(seen[0], (sys.executable, 5))
+        self.assertEqual(seen[1][0], "xwd")
+        self.assertLess(seen[1][1], 5)
+        self.assertGreater(seen[1][1], 4)
+
+    def test_xwd_bytes(self):
+        image = cu._XImage(width=2, height=1, format=2, byte_order=0, bitmap_unit=32, bitmap_pad=32, depth=24,
+                           bytes_per_line=8, bits_per_pixel=32)
+        visual = cu._Visual(visual_class=4, red_mask=0xFF0000, green_mask=0xFF00, blue_mask=0xFF, bits_per_rgb=8,
+                            map_entries=256)
+        data = cu.xwd_bytes(image, b"\x03\x02\x01\x00\x06\x05\x04\x00", visual)
+        self.assertEqual(cu.xwd_to_rgb(data), (2, 1, [bytes([1, 2, 3, 4, 5, 6])]))
